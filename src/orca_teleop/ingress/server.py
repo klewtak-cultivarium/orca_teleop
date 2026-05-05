@@ -18,6 +18,7 @@ Typical usage inside the pipeline::
 import logging
 import queue
 import threading
+import time
 from concurrent import futures
 from dataclasses import dataclass
 from typing import Literal
@@ -29,6 +30,8 @@ from orca_teleop.constants import _COORDS_PER_POINT, _EXPECTED_LEN, _NUM_KEYPOIN
 from orca_teleop.ingress import hand_stream_pb2, hand_stream_pb2_grpc
 
 logger = logging.getLogger(__name__)
+
+PUBLISHER_CONNECT_WAIT_S = 5.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -64,11 +67,36 @@ class _HandStreamServicer(hand_stream_pb2_grpc.HandStreamServicer):
         frames_received = 0
         peer = context.peer() or "unknown"
         logger.info("Publisher connected: %s", peer)
+        # One-shot watchdog: if we haven't seen a frame from this publisher
+        # within PUBLISHER_CONNECT_WAIT_S of connect, surface it
+        connect_t = time.monotonic()
+        warned_silent = False
 
         try:
             for frame in request_iterator:
                 if self._stop.is_set():
                     break
+
+                if frames_received == 0:
+                    logger.info(
+                        "Publisher first frame: %s (handedness=%r, %d keypoint floats)",
+                        peer,
+                        frame.handedness,
+                        len(frame.keypoints),
+                    )
+
+                if (
+                    not warned_silent
+                    and frames_received == 0
+                    and (time.monotonic() - connect_t > PUBLISHER_CONNECT_WAIT_S)
+                ):
+                    logger.warning(
+                        "Publisher %s connected for >%d s but no frames received yet — "
+                        "is the upstream source (e.g. Quest) actually streaming?",
+                        peer,
+                        PUBLISHER_CONNECT_WAIT_S,
+                    )
+                    warned_silent = True
 
                 if len(frame.keypoints) != _EXPECTED_LEN:
                     logger.warning(
