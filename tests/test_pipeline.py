@@ -6,6 +6,7 @@ import inspect
 import queue
 import threading
 import time
+from types import SimpleNamespace
 
 import grpc
 import numpy as np
@@ -20,6 +21,7 @@ from orca_teleop.pipeline import (
     _SHUTDOWN,
     TeleopAction,
     TeleopQueues,
+    _resolve_model_config_for_hand,
     retargeter_worker,
     robot_worker,
     run,
@@ -69,6 +71,40 @@ def test_pipeline_queues_dataclass():
 def test_run_signature_stable():
     sig = inspect.signature(run)
     assert "model_path" in sig.parameters
+
+
+def test_resolve_model_config_uses_default_for_requested_hand(monkeypatch):
+    calls = []
+
+    def default_config(handedness):
+        calls.append(handedness)
+        return f"/models/orcahand_{handedness}/config.yaml"
+
+    monkeypatch.setattr("orca_teleop.pipeline._default_model_config_for_hand", default_config)
+
+    assert _resolve_model_config_for_hand(None, "left") == "/models/orcahand_left/config.yaml"
+    assert calls == ["left"]
+
+
+def test_resolve_model_config_accepts_matching_explicit_config(monkeypatch):
+    class _TypedHand:
+        def __init__(self, _model_path):
+            self.config = SimpleNamespace(type="right")
+
+    monkeypatch.setattr("orca_teleop.pipeline.OrcaHand", _TypedHand)
+
+    assert _resolve_model_config_for_hand("/custom/config.yaml", "right") == "/custom/config.yaml"
+
+
+def test_resolve_model_config_rejects_mismatched_explicit_config(monkeypatch):
+    class _TypedHand:
+        def __init__(self, _model_path):
+            self.config = SimpleNamespace(type="right")
+
+    monkeypatch.setattr("orca_teleop.pipeline.OrcaHand", _TypedHand)
+
+    with pytest.raises(ValueError, match="does not match handedness 'left'"):
+        _resolve_model_config_for_hand("/custom/config.yaml", "left")
 
 
 def test_ingress_server_start_stop():
