@@ -61,6 +61,7 @@ DEFAULT_SERVER = "localhost:50051"
 DEFAULT_FPS = 30
 DEFAULT_QUEST_HOST = "0.0.0.0"
 DEFAULT_QUEST_PORT = 9000
+WAIT_PERIOD_S = 5.0
 
 
 def _quat_to_rotmat(qx: float, qy: float, qz: float, qw: float) -> np.ndarray:
@@ -137,14 +138,32 @@ class MetaQuestPublisher:
 
     def _producer_loop(self) -> None:
         """Drain HTS frames as fast as they arrive into the per-side cache."""
+        logger.info(
+            "HTS producer started: listening on %s %s:%d (waiting for Quest events)…",
+            self._transport_mode.value,
+            self._quest_host,
+            self._quest_port,
+        )
+        seen_any_event = False
+        seen_any_frame = False
+        seen_side: dict[HandSide, bool] = {HandSide.LEFT: False, HandSide.RIGHT: False}
         try:
             for event in self._client.iter_events():
                 if self._stop.is_set():
                     return
+                if not seen_any_event:
+                    seen_any_event = True
+                    logger.info("HTS first event received: %s", type(event).__name__)
                 if not isinstance(event, HandFrame):
                     continue
                 if event.side not in (HandSide.LEFT, HandSide.RIGHT):
                     continue
+                if not seen_any_frame:
+                    seen_any_frame = True
+                    logger.info("HTS first HandFrame received (side=%s)", event.side.value)
+                if not seen_side[event.side]:
+                    seen_side[event.side] = True
+                    logger.info("HTS first %s HandFrame received", event.side.value)
                 with self._lock:
                     self._latest[event.side] = event
         except Exception:
@@ -189,10 +208,13 @@ class MetaQuestPublisher:
             self._quest_host,
             self._quest_port,
         )
+
+        next_silence_log = time.monotonic() + WAIT_PERIOD_S
         while not self._stop.is_set():
             next_tick += self._period
             with self._lock:
                 snapshot = dict(self._latest)
+            tick_emitted = 0
             for side in (HandSide.LEFT, HandSide.RIGHT):
                 frame = snapshot[side]
                 if frame is None:
@@ -202,6 +224,7 @@ class MetaQuestPublisher:
                 last_seq[side] = frame.sequence_id
                 yield self._frame_to_proto(frame)
                 emitted += 1
+                tick_emitted += 1
                 if emitted % log_every == 0:
                     logger.info(
                         "emitted=%d  L_seq=%s  R_seq=%s",
@@ -209,7 +232,24 @@ class MetaQuestPublisher:
                         last_seq[HandSide.LEFT],
                         last_seq[HandSide.RIGHT],
                     )
-            sleep_for = next_tick - time.monotonic()
+            now = time.monotonic()
+            if tick_emitted == 0 and now >= next_silence_log:
+                stats = self._client.get_stats()
+                logger.warning(
+                    "No frames emitted in last %d s (HTS %s:%d): "
+                    "lines_received=%d parse_errors=%d packets_emitted=%d frames_emitted=%d",
+                    WAIT_PERIOD_S,
+                    self._quest_host,
+                    self._quest_port,
+                    stats.lines_received,
+                    stats.parse_errors,
+                    stats.packets_emitted,
+                    stats.frames_emitted,
+                )
+                next_silence_log = now + WAIT_PERIOD_S
+            elif tick_emitted > 0:
+                next_silence_log = now + WAIT_PERIOD_S
+            sleep_for = next_tick - now
             if sleep_for > 0:
                 time.sleep(sleep_for)
             else:
