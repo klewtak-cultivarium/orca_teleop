@@ -1,238 +1,59 @@
-"""Scrappy OrcaArm sink: pink IK + meshcat visualization.
+"""OrcaArm meshcat visualization.
 
-Proof-of-concept for driving the orca_arm's 5-DOF arms via IK from
-wrist-pose targets.  No pipeline integration yet — this module is
-self-contained and meant to be driven by a demo script.
+Renders the OrcaArm URDF in meshcat and overlays per-side target /
+current-EE triads. Consumes pre-solved arm joint angles (from
+:mod:`orca_teleop.arm_ik`) plus optional hand joint positions from the
+retargeter — no IK or kinematics math lives here.
 """
 
 import logging
-from dataclasses import dataclass
 
 import meshcat
 import meshcat.geometry as g
 import numpy as np
 import orca_arm
-import pink
-import pinocchio as pin
 import yourdfpy
-from pink.limits import ConfigurationLimit
+from orca_core import OrcaJointPositions
+
+from orca_teleop.arm_ik import ARM_JOINTS_PER_SIDE, CARPALS_SIDE_PREFIX, SIDES
 
 logger = logging.getLogger(__name__)
 
-_ARM_JOINTS_PER_SIDE = 5
-_SIDES = ("left", "right")
+# Retargeter joint IDs -> generated orcabot URDF joint-name fragments. The
+# OrcaArm URDF embeds OrcaHand joints with CAD-derived names, so we resolve
+# actual indices by substring instead of depending on the full hashy names.
+_HAND_JOINT_MARKERS = {
+    "thumb_mcp": {"left": "T-TP-L_92b8100b_to_", "right": "T-TP-R_1c2b802d_to_"},
+    "thumb_abd": {"left": "L-T-AP_58680c44_to_", "right": "R-T-AP_a9723101_to_"},
+    "thumb_cmc": {"left": "T-PP_ef067304_to_", "right": "T-PP_68395e98_to_"},
+    "thumb_pip": {"left": "T-PP_ef067304_to_", "right": "T-PP_68395e98_to_"},
+    "thumb_dip": {"left": "T-DP_307db3cc_to_", "right": "T-DP_b7429e50_to_"},
+    "index_abd": {"left": "I-AP-L_57ce92f7_to_", "right": "I-AP-R_d95d02d1_to_"},
+    "index_mcp": {"left": "I-PP_3df4f91d_to_", "right": "I-PP_bacbd481_to_"},
+    "index_pip": {
+        "left": "I-FingerTipAssembly_ed91b18a_to_",
+        "right": "I-FingerTipAssembly_ec49c16c_to_",
+    },
+    "middle_abd": {"left": "M-AP_e04a96f2_to_", "right": "M-AP_e04a96f2_to_"},
+    "middle_mcp": {"left": "M-PP_08efa608_to_", "right": "M-PP_08efa608_to_"},
+    "middle_pip": {
+        "left": "M-FingerTipAssembly_34afb748_to_",
+        "right": "M-FingerTipAssembly_34afb748_to_",
+    },
+    "ring_abd": {"left": "M-AP_6ec59111_to_", "right": "M-AP_6ec59111_to_"},
+    "ring_mcp": {"left": "M-PP_8660a1eb_to_", "right": "M-PP_8660a1eb_to_"},
+    "ring_pip": {
+        "left": "M-FingerTipAssembly_424a8e75_to_",
+        "right": "M-FingerTipAssembly_424a8e75_to_",
+    },
+    "pinky_abd": {"left": "P-AP_f5e42b61_to_", "right": "P-AP_f5e42b61_to_"},
+    "pinky_mcp": {"left": "P-PP_1d411b9b_to_", "right": "P-PP_1d411b9b_to_"},
+    "pinky_pip": {
+        "left": "P-FingerTipAssembly_cd219176_to_",
+        "right": "P-FingerTipAssembly_cd219176_to_",
+    },
+}
 
-# Carpals frame naming pattern: orcahand_{side}_{L|R}-Carpals_{hash}
-_CARPALS_SIDE_PREFIX = {"left": "L", "right": "R"}
-
-
-@dataclass(frozen=True)
-class IKResult:
-    q: np.ndarray
-    position_error: dict[str, float]
-    orientation_error: dict[str, float]
-    converged: dict[str, bool]
-
-
-def _find_carpals_frame_name(model: pin.Model, side: str) -> str:
-    """Find the carpals frame name by pattern (avoids hardcoding hashes)."""
-    prefix = f"orcahand_{side}_{_CARPALS_SIDE_PREFIX[side]}-Carpals_"
-    for i in range(model.nframes):
-        name = model.frames[i].name
-        if name.startswith(prefix) and "to_" not in name:
-            return name
-    raise ValueError(f"Carpals frame not found for side={side!r}")
-
-
-class BimanualIKSolver:
-    """Pink-based full-pose IK for both arms of the OrcaArm.
-
-    One pinocchio model, one config vector. Uses pink's QP-based
-    differential IK with FrameTask (position + orientation) to match
-    the full 6D wrist pose. Non-arm joints are locked via position
-    limits (upper = lower = neutral).
-    """
-
-    def __init__(
-        self,
-        max_iters: int = 100,
-        dt: float = 0.1,
-        pos_tol: float = 1e-3,
-        ori_tol: float = 0.01,
-        solver: str = "quadprog",
-        orientation_cost: float = 0.0,
-        posture_cost: float = 0.0,
-    ) -> None:
-        # NOTE on orientation_cost: the OrcaArm has 5 DOF per side, but a 6D
-        # SE(3) wrist pose has 6 dimensions of freedom. Asking the IK to track
-        # full 6D pose with any orientation_cost > 0 forces the QP to trade
-        # position for orientation along the unreachable direction, costing
-        # tens of mm of position error even for in-reach targets. Pass a
-        # 3-vector (e.g. [1, 1, 0]) to leave one body-frame axis free for a
-        # 5-DOF tracking formulation that the arm CAN satisfy exactly.
-        # NOTE on posture_cost: a small positive value (e.g. 1e-3) regularizes
-        # the IK against branch flips at near-singular configs. The posture
-        # target is re-anchored to ``q0`` on every ``solve`` call, so the task
-        # penalizes frame-to-frame *change* without biasing toward any
-        # specific posture (no "pulled toward home" feel).
-        self._max_iters = max_iters
-        self._dt = dt
-        self._pos_tol = pos_tol
-        self._ori_tol = ori_tol
-        self._solver = solver
-        self._orientation_cost = orientation_cost
-        self._posture_cost = posture_cost
-
-        self._model = pin.buildModelFromUrdf(orca_arm.URDF_PATH)
-        self._data = self._model.createData()
-
-        # Lock all non-arm joints by pinching their position limits
-        arm_joint_names: set[str] = set()
-        for side in _SIDES:
-            for i in range(1, _ARM_JOINTS_PER_SIDE + 1):
-                arm_joint_names.add(f"openarm_{side}_joint{i}")
-
-        q_neutral = pin.neutral(self._model)
-        for i in range(1, self._model.njoints):
-            name = self._model.names[i]
-            if name not in arm_joint_names:
-                idx_q = self._model.joints[i].idx_q
-                nq = self._model.joints[i].nq
-                for j in range(nq):
-                    self._model.lowerPositionLimit[idx_q + j] = q_neutral[idx_q + j]
-                    self._model.upperPositionLimit[idx_q + j] = q_neutral[idx_q + j]
-
-        self._limits = [ConfigurationLimit(self._model)]
-
-        # Per-side frame names, tasks, and joint indices
-        self._carpals_names: dict[str, str] = {}
-        self._tasks: dict[str, pink.FrameTask] = {}
-        self._arm_idx_q: dict[str, list[int]] = {}
-
-        for side in _SIDES:
-            self._carpals_names[side] = _find_carpals_frame_name(self._model, side)
-            self._tasks[side] = pink.FrameTask(
-                self._carpals_names[side],
-                position_cost=1.0,
-                orientation_cost=self._orientation_cost,
-            )
-            joint_names = [f"openarm_{side}_joint{i}" for i in range(1, _ARM_JOINTS_PER_SIDE + 1)]
-            self._arm_idx_q[side] = [
-                self._model.joints[self._model.getJointId(j)].idx_q for j in joint_names
-            ]
-
-        self._posture_task: pink.PostureTask | None = (
-            pink.PostureTask(cost=self._posture_cost) if self._posture_cost > 0.0 else None
-        )
-
-    @property
-    def neutral_q(self) -> np.ndarray:
-        return pin.neutral(self._model).copy()
-
-    @property
-    def arm_joint_names(self) -> dict[str, list[str]]:
-        """Joint names at each entry of ``self._arm_idx_q[side]``, reverse-
-        looked-up from the pinocchio model. Used to validate that this class
-        and its consumers (e.g. the sink) agree on per-side joint orderings."""
-        out: dict[str, list[str]] = {}
-        for side, indices in self._arm_idx_q.items():
-            names = []
-            for idx_q in indices:
-                jid = next(
-                    j for j in range(self._model.njoints) if self._model.joints[j].idx_q == idx_q
-                )
-                names.append(self._model.names[jid])
-            out[side] = names
-        return out
-
-    def forward_kinematics(self, q: np.ndarray, side: str) -> np.ndarray:
-        """Return the 3-D world position of the wrist for config *q*."""
-        return self.forward_kinematics_full(q, side)[:3, 3]
-
-    def forward_kinematics_full(self, q: np.ndarray, side: str) -> np.ndarray:
-        """Return the 4x4 world transform of the wrist for config *q*."""
-        pin.forwardKinematics(self._model, self._data, q)
-        fid = self._model.getFrameId(self._carpals_names[side])
-        pin.updateFramePlacement(self._model, self._data, fid)
-        return self._data.oMf[fid].homogeneous.copy()
-
-    def sample_reachable_target(self, side: str, rng: np.random.Generator) -> pin.SE3:
-        """FK at a random arm joint config → guaranteed reachable SE3 pose."""
-        q = pin.neutral(self._model)
-        for idx_q in self._arm_idx_q[side]:
-            lo = self._model.lowerPositionLimit[idx_q]
-            hi = self._model.upperPositionLimit[idx_q]
-            q[idx_q] = rng.uniform(lo, hi)
-        pin.forwardKinematics(self._model, self._data, q)
-        fid = self._model.getFrameId(self._carpals_names[side])
-        pin.updateFramePlacement(self._model, self._data, fid)
-        return pin.SE3(self._data.oMf[fid])
-
-    def solve(
-        self,
-        targets: dict[str, pin.SE3],
-        q0: np.ndarray,
-    ) -> IKResult:
-        """Solve full-pose IK for one or both arms.
-
-        Args:
-            targets: ``{side: SE3 target pose}`` for each arm to solve.
-            q0: full robot config to start from.
-
-        Returns:
-            IKResult with the solved config and per-side errors.
-        """
-        config = pink.Configuration(self._model, self._data, q0.copy())
-
-        # Set targets on the frame tasks
-        active_tasks = []
-        for side, target_pose in targets.items():
-            self._tasks[side].set_target(target_pose)
-            active_tasks.append(self._tasks[side])
-        if self._posture_task is not None:
-            self._posture_task.set_target(q0.copy())
-            active_tasks.append(self._posture_task)
-
-        for _ in range(self._max_iters):
-            vel = pink.solve_ik(
-                config,
-                active_tasks,
-                self._dt,
-                solver=self._solver,
-                limits=self._limits,
-            )
-            config.integrate_inplace(vel, self._dt)
-
-            # Check convergence for all sides
-            all_converged = True
-            for side in targets:
-                T_now = config.get_transform_frame_to_world(self._carpals_names[side])
-                pos_err = np.linalg.norm(T_now.translation - targets[side].translation)
-                ori_err = np.linalg.norm(pin.log3(T_now.rotation.T @ targets[side].rotation))
-                if pos_err > self._pos_tol or ori_err > self._ori_tol:
-                    all_converged = False
-            if all_converged:
-                break
-
-        # Collect final errors
-        q_result = config.q
-        pos_errors: dict[str, float] = {}
-        ori_errors: dict[str, float] = {}
-        converged: dict[str, bool] = {}
-        for side, target_pose in targets.items():
-            T_now = config.get_transform_frame_to_world(self._carpals_names[side])
-            pos_errors[side] = float(np.linalg.norm(T_now.translation - target_pose.translation))
-            ori_errors[side] = float(
-                np.linalg.norm(pin.log3(T_now.rotation.T @ target_pose.rotation))
-            )
-            converged[side] = pos_errors[side] < self._pos_tol and ori_errors[side] < self._ori_tol
-
-        return IKResult(
-            q=q_result, position_error=pos_errors, orientation_error=ori_errors, converged=converged
-        )
-
-
-# ── Meshcat visualization ────────────────────────────────────────────────────
 
 _TRIAD_AXIS_LEN = 0.10
 _TRIAD_AXIS_R = 0.004
@@ -279,12 +100,14 @@ class OrcaArmMeshcatSink:
 
         # Per-side: cfg indices and EE scene-graph node
         self._arm_cfg_indices: dict[str, list[int]] = {}
+        self._hand_cfg_indices: dict[str, dict[str, int]] = {}
         self._ee_links: dict[str, str] = {}
-        for side in _SIDES:
+        for side in SIDES:
             self._arm_cfg_indices[side] = [
                 self._actuated_names.index(f"openarm_{side}_joint{i}")
-                for i in range(1, _ARM_JOINTS_PER_SIDE + 1)
+                for i in range(1, ARM_JOINTS_PER_SIDE + 1)
             ]
+            self._hand_cfg_indices[side] = self._resolve_hand_joint_indices(side)
             self._ee_links[side] = next(
                 (
                     n
@@ -297,6 +120,15 @@ class OrcaArmMeshcatSink:
         self._vis: meshcat.Visualizer | None = None
         self._geom_map: dict[str, str] = {}
 
+        # Immutable neutral pose owned by the sink: per-side URDF defaults
+        # (all zeros). Callers cannot rebind it — :meth:`to_neutral_configuration`
+        # accepts an ``arm_angles`` argument as a one-shot render override
+        # only. Treat this as the canonical "where the robot sits before any
+        # operator input" state.
+        self._q_home: dict[str, np.ndarray] = {
+            side: np.zeros(ARM_JOINTS_PER_SIDE, dtype=np.float64) for side in SIDES
+        }
+
     @property
     def arm_joint_names(self) -> dict[str, list[str]]:
         """Joint names at each entry of ``self._arm_cfg_indices[side]``."""
@@ -305,12 +137,49 @@ class OrcaArmMeshcatSink:
             for side, indices in self._arm_cfg_indices.items()
         }
 
+    def _resolve_hand_joint_indices(self, side: str) -> dict[str, int]:
+        prefix = f"orcahand_{side}_"
+        out: dict[str, int] = {}
+
+        wrist_matches = [
+            i
+            for i, name in enumerate(self._actuated_names)
+            if name.startswith(f"{prefix}{CARPALS_SIDE_PREFIX[side]}-Carpals_")
+            and "_to_TopTower-Model_" in name
+        ]
+        if len(wrist_matches) == 1:
+            out["wrist"] = wrist_matches[0]
+        else:
+            logger.warning(
+                "Could not resolve %s hand joint wrist in OrcaArm URDF (matches=%d)",
+                side,
+                len(wrist_matches),
+            )
+
+        for joint_id, side_markers in _HAND_JOINT_MARKERS.items():
+            marker = side_markers[side]
+            matches = [
+                i
+                for i, name in enumerate(self._actuated_names)
+                if name.startswith(prefix) and marker in name
+            ]
+            if len(matches) != 1:
+                logger.warning(
+                    "Could not resolve %s hand joint %s in OrcaArm URDF (matches=%d)",
+                    side,
+                    joint_id,
+                    len(matches),
+                )
+                continue
+            out[joint_id] = matches[0]
+        return out
+
     def launch(self) -> None:
         self._vis = meshcat.Visualizer()
         self._vis.open()
         self._vis.delete()
         self._load_robot_meshes()
-        for side in _SIDES:
+        for side in SIDES:
             self._create_triads(side)
         logger.info("Meshcat viewer: %s", self._vis.url())
 
@@ -362,21 +231,58 @@ class OrcaArmMeshcatSink:
                 T_world @ _AXIS_LOCAL_T[axis_name]
             )
 
+    def to_neutral_configuration(self, arm_angles: dict[str, np.ndarray] | None = None) -> None:
+        """Render the sink's neutral pose, or a one-shot override.
+
+        Teleop scripts should call this once after :meth:`launch` so meshcat
+        shows the starting configuration before any operator input arrives.
+        Pass ``arm_angles`` to render a different pose for this call only —
+        the sink's owned neutral (``self._q_home``) is not mutated. Pass
+        nothing to render the sink's neutral. Target triads are placed at
+        the FK of the rendered pose so target == current (no visual offset).
+        """
+        pose = arm_angles if arm_angles is not None else self._q_home
+        # Apply cfg first so the scene graph reflects the pose, then read FK
+        # back out of yourdfpy for the target triads.
+        cfg = np.zeros(len(self._actuated_names))
+        for side, angles in pose.items():
+            for k, idx in enumerate(self._arm_cfg_indices[side]):
+                cfg[idx] = angles[k]
+        self._robot.update_cfg(cfg)
+        target_Ts: dict[str, np.ndarray] = {}
+        for side in pose:
+            try:
+                T_raw, _ = self._scene.graph.get(self._ee_links[side])
+                target_Ts[side] = T_raw.astype(np.float64)
+            except Exception:
+                pass
+        self.update(pose, target_Ts=target_Ts)
+
     def update(
         self,
         arm_angles: dict[str, np.ndarray],
+        hand_positions: dict[str, OrcaJointPositions] | None = None,
         target_Ts: dict[str, np.ndarray] | None = None,
     ) -> None:
-        """Push new arm configs + marker poses to meshcat.
+        """Push new arm/hand configs + marker poses to meshcat.
 
         Args:
             arm_angles: ``{side: 5-element radians array}`` for each active side.
+            hand_positions: ``{side: OrcaJointPositions}`` in physical degrees
+                from the Retargeter. Missing joints are left at zero.
             target_Ts: ``{side: 4x4 world transform}`` for target triads.
         """
         cfg = np.zeros(len(self._actuated_names))
         for side, angles in arm_angles.items():
             for k, idx in enumerate(self._arm_cfg_indices[side]):
                 cfg[idx] = angles[k]
+        if hand_positions is not None:
+            for side, positions in hand_positions.items():
+                for joint_id, value_deg in positions:
+                    idx = self._hand_cfg_indices.get(side, {}).get(joint_id)
+                    if idx is None:
+                        continue
+                    cfg[idx] = np.deg2rad(value_deg)
 
         self._robot.update_cfg(cfg)
 
