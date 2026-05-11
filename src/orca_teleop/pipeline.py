@@ -62,7 +62,7 @@ if TYPE_CHECKING:
     # Don't necessarily import IK for wrist, because teleop is also hand only.
     import pinocchio as pin
 
-    from orca_teleop.arm_ik import BimanualIKSolver
+    from orca_teleop.orca_arm_ik import BimanualIKSolver
 
 logger = logging.getLogger(__name__)
 
