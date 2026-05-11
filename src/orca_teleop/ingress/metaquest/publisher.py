@@ -22,7 +22,7 @@ Usage::
 
     # Live Quest (default)
     python -m orca_teleop.ingress.metaquest.publisher \\
-        --quest-port 9000 --transport udp
+        --quest-port 8765 --transport udp
 
     # Dataset replay
     python -m orca_teleop.ingress.metaquest.publisher --dummy
@@ -60,7 +60,7 @@ DEFAULT_FILENAME = "data.parquet"
 DEFAULT_SERVER = "localhost:50051"
 DEFAULT_FPS = 30
 DEFAULT_QUEST_HOST = "0.0.0.0"
-DEFAULT_QUEST_PORT = 9000
+DEFAULT_QUEST_PORT = 8765
 WAIT_PERIOD_S = 5.0
 
 
