@@ -2,7 +2,7 @@
 
 Renders the OrcaArm URDF in meshcat and overlays per-side target /
 current-EE triads. Consumes pre-solved arm joint angles (from
-:mod:`orca_teleop.arm_ik`) plus optional hand joint positions from the
+:mod:`orca_teleop.orca_arm_ik`) plus optional hand joint positions from the
 retargeter — no IK or kinematics math lives here.
 """
 
@@ -15,7 +15,7 @@ import orca_arm
 import yourdfpy
 from orca_core import OrcaJointPositions
 
-from orca_teleop.arm_ik import ARM_JOINTS_PER_SIDE, CARPALS_SIDE_PREFIX, SIDES
+from orca_teleop.orca_arm_ik import ARM_JOINTS_PER_SIDE, CARPALS_SIDE_PREFIX, SIDES
 
 logger = logging.getLogger(__name__)
 
