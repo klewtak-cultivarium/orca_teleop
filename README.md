@@ -30,7 +30,7 @@ python scripts/mediapipe_teleop_demo.py     path/to/your_orcahand_model     path
 ## Arm Teleop Pipeline
 
 The arm demos all end at the same boundary: `BimanualIKSolver.solve(...)` in
-`src/orca_teleop/orca_arm_sink.py` expects absolute `pin.SE3` wrist targets in
+`src/orca_teleop/orca_arm_ik.py` expects absolute `pin.SE3` wrist targets in
 robot world coordinates, and `OrcaArmMeshcatSink` renders the solved arm state.
 
 `scripts/teleop_arm_sim.py` is the synthetic smoke test for that boundary. It
