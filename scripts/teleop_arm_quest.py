@@ -39,7 +39,6 @@ import pinocchio as pin
 from hand_tracking_sdk.convert import BASIS_UNITY_LEFT_TO_FLU
 from orca_core import OrcaJointPositions
 
-from orca_teleop.arm_ik import BimanualIKSolver
 from orca_teleop.constants import (
     AUTO_FIT_MARGIN,
     BOOTSTRAP_SCALE,
@@ -47,6 +46,7 @@ from orca_teleop.constants import (
     CUTOFF_MIN,
     DEFAULT_PORT,
     INGRESS_FPS,
+    MAX_JOINT_STEP_RAD,
     MIN_SPAN_SAMPLES,
     QUEUES_MAXSIZE,
     SPAN_BUFFER_SECONDS,
@@ -54,10 +54,11 @@ from orca_teleop.constants import (
     SPAN_REFIT_PERIOD_S,
     STILL_THRESHOLD_M,
     STILL_WINDOW_SAMPLES,
-    WORKSPACE_HALF_BOX_M,
+    WORKSPACE_DELTA_LIMITS_M,
 )
 from orca_teleop.ingress.metaquest.landmarks import retargeter_landmarks_from_quest
 from orca_teleop.ingress.server import HandLandmarks, IngressServer
+from orca_teleop.orca_arm_ik import BimanualIKSolver
 from orca_teleop.orca_arm_sink import OrcaArmMeshcatSink
 from orca_teleop.retargeting.retargeter import Retargeter, TargetPose
 
@@ -133,15 +134,18 @@ def _drain_queue(
     clutch_start_t: dict[str, float | None],
     T_first: dict[str, pin.SE3],
     T_home: dict[str, pin.SE3],
-    scale: dict[str, float],
+    scale: dict[str, np.ndarray],
     targets: dict[str, pin.SE3],
     hand_targets: dict[str, OrcaJointPositions],
+    new_target_acquire_ns: dict[str, int],
     ik: BimanualIKSolver,
     retargeters: dict[str, Retargeter],
     q_prev: np.ndarray,
     *,
     manual_scale: float | None,
-    workspace_half_box_m: tuple[float, float, float],
+    workspace_delta_limits_m: dict[
+        str, tuple[tuple[float, float, float], tuple[float, float, float]]
+    ],
     auto_fit_margin: float,
     min_span_samples: int,
     span_refit_period_s: float,
@@ -150,6 +154,12 @@ def _drain_queue(
     still_window_samples: int,
     clutch_grace_s: float,
 ) -> None:
+    # NOTE: yes, the signature is long. Every dict here is real per-side state
+    # that we mutate in place, plus the tuning knobs the script passes through
+    # from constants/CLI flags. The refactor is to bundle these into a state
+    # dataclass + a config dataclass, but that's a follow-up after we ship —
+    # the explicit list keeps the contract visible while the state machine
+    # is still being tuned.
     """Per-side state machine: ``awaiting_anchor`` → ``tracking`` ⇄ ``clutched``.
 
     Stillness is the engagement gesture. While ``awaiting_anchor``, the side
@@ -192,6 +202,13 @@ def _drain_queue(
         item = latest_by_side.get(side)
         if item is None:
             continue
+
+        # Per-side asymmetric reach envelope, captured once per tick so the
+        # span re-fit and the clip site agree on the same numbers.
+        side_lo, side_hi = (
+            np.asarray(workspace_delta_limits_m[side][0], dtype=np.float64),
+            np.asarray(workspace_delta_limits_m[side][1], dtype=np.float64),
+        )
 
         # Convert the wrist pose to FLU coordinates before deriving arm targets
         # or the direct hand-wrist motor command.
@@ -243,8 +260,9 @@ def _drain_queue(
                 # Seed an initial target at the side's home pose so the IK has
                 # something to track immediately (delta = 0 is lack of motion).
                 targets[side] = pin.SE3(T_home[side].rotation, T_home[side].translation.copy())
+                new_target_acquire_ns[side] = int(item.timestamp_ns)
                 if manual_scale is not None:
-                    scale[side] = manual_scale
+                    scale[side] = np.full(3, float(manual_scale), dtype=np.float64)
 
             continue
 
@@ -255,7 +273,7 @@ def _drain_queue(
         # Measuring the operator's ROM to estimate workspaces' ratio
         span_buffer[side].append(T_op.translation.copy())
         if side not in scale:
-            scale[side] = BOOTSTRAP_SCALE
+            scale[side] = np.full(3, BOOTSTRAP_SCALE, dtype=np.float64)
 
         now = time.monotonic()
         if (
@@ -266,26 +284,30 @@ def _drain_queue(
         ):
             buffer_positions = np.array(span_buffer[side])
             operator_halfspace = (buffer_positions.max(axis=0) - buffer_positions.min(axis=0)) / 2.0
-            robot_halfspace = np.asarray(workspace_half_box_m, dtype=np.float64)
+            # The reach envelope is asymmetric; the scale ratio only needs a
+            # per-axis magnitude. (hi - lo) / 2 is the half-width of the box on
+            # each axis and matches what the old symmetric constant encoded.
+            robot_halfspace = (side_hi - side_lo) / 2.0
 
-            # Per-axis aware fit, picking the most-restrictive axis ratio
-            fitted_per_axis = robot_halfspace / np.maximum(operator_halfspace, 1e-3)
-            robot_to_operator_ratio = float(
-                np.clip(fitted_per_axis.min(), CUTOFF_MIN, 1 - CUTOFF_MIN)  # avoiding singularity
+            # Per-axis gain: each axis gets its own ratio so a cramped reach on
+            # one axis doesn't drag the gain down on the others. Clipped to
+            # ``[CUTOFF_MIN, 1 - CUTOFF_MIN]`` to dodge the 0 / 1 singularities.
+            new_ratio = np.clip(
+                robot_halfspace / np.maximum(operator_halfspace, 1e-3),
+                CUTOFF_MIN,
+                1 - CUTOFF_MIN,
             )
-
-            new_ratio = robot_to_operator_ratio
             old_ratio = scale[side]
-            if abs(new_ratio - old_ratio) / max(old_ratio, 1e-6) > span_change_threshold:
+            rel_change = np.max(np.abs(new_ratio - old_ratio) / np.maximum(old_ratio, 1e-6))
+            if rel_change > span_change_threshold:
                 scale[side] = new_ratio
-                limiting = ("x", "y", "z")[int(np.argmin(fitted_per_axis))]
                 logger.info(
-                    "Span re-fit %s: %.3f → %.3f (op_half=%s m, limiting=%s, n=%d)",
+                    "Span re-fit %s: %s → %s (op_half=%s m, rel_change=%.3f, n=%d)",
                     side,
-                    old_ratio,
-                    new_ratio,
+                    np.round(old_ratio, 3).tolist(),
+                    np.round(new_ratio, 3).tolist(),
                     np.round(operator_halfspace, 3).tolist(),
-                    limiting,
+                    float(rel_change),
                     len(span_buffer[side]),
                 )
             last_refit_t[side] = now
@@ -317,14 +339,17 @@ def _drain_queue(
         dR = T_op.rotation @ T_first[side].rotation.T
         dp = s * (T_op.translation - T_first[side].translation)
 
-        robot_halfspace = np.asarray(workspace_half_box_m, dtype=np.float64)
-        if np.any(robot_halfspace > 0.0):
-            dp = np.clip(dp, -robot_halfspace, robot_halfspace)
+        # Asymmetric per-axis clip: the carpals reach further backward than
+        # forward (left arm) / further right than left (right arm) / much further
+        # up than down. Clipping to (side_lo, side_hi) directly preserves that
+        # asymmetry instead of collapsing to the worst symmetric scalar.
+        dp = np.clip(dp, side_lo, side_hi)
 
         targets[side] = pin.SE3(
             dR @ T_home[side].rotation,
             T_home[side].translation + dp,
         )
+        new_target_acquire_ns[side] = int(item.timestamp_ns)
 
 
 def _metaquest_publisher(
@@ -436,12 +461,18 @@ def main() -> None:
     )
     parser.add_argument(
         "--free-roll-axis",
-        default="Y",
+        default="Z",
         choices=["X", "Y", "Z"],
         help="body-frame axis whose rotation is unconstrained when orientation-cost > 0."
-        " Default Y: empirically best on the OrcaArm URDF (1/900 stuck frames vs"
-        " 15/900 for Z). Z is more intuitive (free wrist roll about local +Z) but"
-        " gives a less usable null space on this kinematic chain.",
+        " Default Z: in the home pose body-frame Z is ~antiparallel to world FLU +Z,"
+        " which is exactly the axis the hand wrist motor compensates for"
+        " (see _relative_flu_z_angle_degrees). Leaving Z free in the arm IK and"
+        " letting the hand motor add the roll keeps the full 6-DOF operator pose"
+        " tracked end-to-end. Y was the previous default — empirically slightly fewer"
+        " stuck IK frames (1/900 vs 15/900) measured without the hand motor in the"
+        " loop, but it drops *lateral* wrist tilt that nothing else recovers, so the"
+        " operator feels the arm refusing to follow their roll. Flip back to Y if a"
+        " real session shows the QP getting stuck too often.",
     )
     parser.add_argument(
         "--posture-cost",
@@ -543,9 +574,17 @@ def main() -> None:
     last_refit_t: dict[str, float] = {side: 0.0 for side in SIDES}
     clutch_start_t: dict[str, float | None] = {side: None for side in SIDES}
     T_first: dict[str, pin.SE3] = {}
-    scale: dict[str, float] = {}
+    scale: dict[str, np.ndarray] = {}
     targets: dict[str, pin.SE3] = {}
     hand_targets: dict[str, OrcaJointPositions] = {}
+    # One-shot per-tick: _drain_queue populates the source frame timestamp_ns
+    # for any side it commits a new target on. Main loop drains it after
+    # sink.update() to compute end-to-end (acquire → executed) latency.
+    new_target_acquire_ns: dict[str, int] = {}
+    # Rolling buffer of end-to-end latencies in milliseconds. Sized for ~10s
+    # of samples at INGRESS_FPS = 30, so the periodic 5s log line has a
+    # stable enough population for p50/p95.
+    lag_samples_ms: collections.deque = collections.deque(maxlen=300)
     q_prev = q_home.copy()
 
     landmarks_q: queue.Queue = queue.Queue(maxsize=QUEUES_MAXSIZE * 4)
@@ -593,6 +632,7 @@ def main() -> None:
 
     try:
         while True:
+            new_target_acquire_ns.clear()
             _drain_queue(
                 landmarks_q,
                 pose_window,
@@ -604,11 +644,12 @@ def main() -> None:
                 scale,
                 targets,
                 hand_targets,
+                new_target_acquire_ns,
                 ik,
                 retargeters,
                 q_prev,
                 manual_scale=args.translation_scale,
-                workspace_half_box_m=WORKSPACE_HALF_BOX_M,
+                workspace_delta_limits_m=WORKSPACE_DELTA_LIMITS_M,
                 auto_fit_margin=AUTO_FIT_MARGIN,
                 min_span_samples=MIN_SPAN_SAMPLES,
                 span_refit_period_s=SPAN_REFIT_PERIOD_S,
@@ -620,22 +661,48 @@ def main() -> None:
 
             if targets:
                 result = ik.solve(targets, q_prev)
-                q_prev = result.q
+                # Per-joint Δq clamp: caps how far any single joint can move in
+                # one IK tick. Catches clutch re-anchors, scale changes, and
+                # tracking blips that would otherwise integrate into a large
+                # one-shot jump. Caller-visible state (q_prev) is the clamped
+                # value, so the next solve starts from where the arm actually
+                # is, not from the unclamped IK output.
+                dq = np.clip(result.q - q_prev, -MAX_JOINT_STEP_RAD, MAX_JOINT_STEP_RAD)
+                q_prev = q_prev + dq
                 arm_angles = {
-                    side: np.array([result.q[idx] for idx in ik._arm_idx_q[side]])
-                    for side in targets
+                    side: np.array([q_prev[idx] for idx in ik._arm_idx_q[side]]) for side in targets
                 }
                 target_Ts = {side: targets[side].homogeneous for side in targets}
                 sink.update(arm_angles, hand_positions=hand_targets, target_Ts=target_Ts)
                 ik_calls += 1
 
+                # End-to-end latency: time.time_ns() here is "executed at sink"
+                # (sink.update just returned). frame.timestamp_ns was stamped
+                # by the publisher when it received the HTS frame, i.e. as
+                # close to "command acquired" as we can get without device-side
+                # clock cooperation. One sample per side that produced a fresh
+                # target this tick.
+                executed_ns = time.time_ns()
+                for ts_ns in new_target_acquire_ns.values():
+                    lag_samples_ms.append((executed_ns - ts_ns) * 1e-6)
+
             now = time.monotonic()
             if now - last_log > 5.0:
+                if lag_samples_ms:
+                    lags = np.asarray(lag_samples_ms)
+                    lag_summary = (
+                        f"e2e_lag_ms p50={np.percentile(lags, 50):.1f} "
+                        f"p95={np.percentile(lags, 95):.1f} "
+                        f"max={lags.max():.1f} n={len(lags)}"
+                    )
+                else:
+                    lag_summary = "e2e_lag_ms=n/a"
                 logger.info(
-                    "ik_calls=%d  active=%s  calibrated=%s",
+                    "ik_calls=%d  active=%s  calibrated=%s  %s",
                     ik_calls,
                     sorted(targets),
                     sorted(T_first),
+                    lag_summary,
                 )
                 last_log = now
 
