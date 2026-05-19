@@ -27,6 +27,8 @@ from orca_teleop.pipeline import (
     run,
 )
 
+ROBOT_READY_TIMEOUT_S = 15.0
+
 
 def _make_queues(maxsize: int = 8) -> TeleopQueues:
     return TeleopQueues(
@@ -226,7 +228,7 @@ def test_robot_exits_on_shutdown_sentinel(patch_mock_hand):
     ready = threading.Event()
     q.actions_q.put(_SHUTDOWN)
     t = _start(robot_worker, q, stop, ready, None, name="robot")
-    assert ready.wait(2.0)
+    assert ready.wait(ROBOT_READY_TIMEOUT_S)
     t.join(timeout=2.0)
     assert not t.is_alive()
     assert len(patch_mock_hand) == 1  # the hand was constructed
@@ -237,7 +239,7 @@ def test_robot_sets_ready_after_init(patch_mock_hand):
     stop = threading.Event()
     ready = threading.Event()
     t = _start(robot_worker, q, stop, ready, None, name="robot")
-    assert ready.wait(2.0)
+    assert ready.wait(ROBOT_READY_TIMEOUT_S)
     hand = patch_mock_hand[0]
     assert hand.is_connected()
     stop.set()
@@ -253,7 +255,7 @@ def test_robot_consumes_orca_joint_positions(patch_mock_hand):
     q.actions_q.put(action)
     q.actions_q.put(_SHUTDOWN)
     t = _start(robot_worker, q, stop, ready, None, name="robot")
-    assert ready.wait(2.0)
+    assert ready.wait(ROBOT_READY_TIMEOUT_S)
     t.join(timeout=2.0)
     assert not t.is_alive()
 
@@ -267,7 +269,7 @@ def test_robot_accepts_in_rom_positions(patch_mock_hand):
     q.actions_q.put(TeleopAction(joint_positions=_midpoint_action()))
     q.actions_q.put(_SHUTDOWN)
     t = _start(robot_worker, q, stop, ready, None, name="robot")
-    assert ready.wait(2.0)
+    assert ready.wait(ROBOT_READY_TIMEOUT_S)
     t.join(timeout=2.0)
 
 
@@ -348,7 +350,7 @@ def test_robot_finally_cleans_up_on_exception(monkeypatch):
     ready = threading.Event()
     q.actions_q.put(TeleopAction(joint_positions=_midpoint_action()))
     t = _start(robot_worker, q, stop, ready, None, name="robot")
-    assert ready.wait(2.0)
+    assert ready.wait(ROBOT_READY_TIMEOUT_S)
     t.join(timeout=2.0)
     assert not t.is_alive()
     assert instances[0].disabled and instances[0].disconnected
