@@ -14,11 +14,10 @@ dependencies = [
     "pytorch-kinematics",
     "grpcio>=1.62.3",
     "protobuf>=4.25.9,<5",
-    "orca_core @ file:///Users/fracapuano/Documents/orca_core",
+    "orca_core @ git+https://github.com/orcahand/orca_core.git@91ef976cdf8206d2b937f765b1d1bce091b9e2c5",
 ]
 
 [project.optional-dependencies]
-# Fix local paths to packages before merging
 test = [
     "pytest>=8.0",
 ]
@@ -31,21 +30,25 @@ avp = [
 ]
 metaquest = [
     "hand-tracking-sdk>=1.1.0",
+    "huggingface-hub>=0.23",
+    "pyarrow>=15",
 ]
 manus = [
     # Add manus pro-related dependencies here
 ]
 sim = [
-    "orca_sim @ file:///Users/fracapuano/Documents/orca_sim"
+    "orca_sim @ git+https://github.com/orcahand/orca_sim.git@53f3e4c595d8c4d79f9adb5d69999602e4ce6f9e"
 ]
 
 orca_arm = [
-    "orca_arm",
-    "orca_sim @ file:///Users/fracapuano/Documents/orca_sim",
-    "orca_core @ file:///Users/fracapuano/Documents/orca_core",
+    "orca_arm @ git+https://github.com/fracapuano/orca_arm.git@d92e47106d282edde6230170aa6e70429a5dccea",
+    "orca_sim @ git+https://github.com/orcahand/orca_sim.git@53f3e4c595d8c4d79f9adb5d69999602e4ce6f9e",
+    "meshcat",
     "placo",
     "pin",
     "pin-pink",
+    "quadprog",
+    "yourdfpy",
     "orca_teleop[metaquest]"
 ]
 

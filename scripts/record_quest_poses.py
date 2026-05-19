@@ -1,14 +1,17 @@
-"""Record Meta Quest hand poses to parquet.
+"""Record Meta Quest hand poses to a Hugging Face parquet dataset.
 
 Connects to a running Hand Tracking Streamer (HTS) on the Quest, waits until the
 first hand frame arrives, then samples both hands at a fixed rate and appends rows
-to a single parquet file.
+to a single parquet file. Unless ``--no-upload`` is passed, the parquet file is
+synced to a Hugging Face dataset repo when recording finishes.
 
     python scripts/record_quest_poses.py
     python scripts/record_quest_poses.py --no-upload --fps 30
+    python scripts/record_quest_poses.py --repo your-hf-user/quest-practice --duration 60
 """
 
 import argparse
+import errno
 import logging
 import os
 import threading
@@ -18,6 +21,7 @@ from pathlib import Path
 import pyarrow as pa
 import pyarrow.parquet as pq
 from hand_tracking_sdk import (
+    ErrorPolicy,
     HandFilter,
     HandFrame,
     HandSide,
@@ -31,8 +35,10 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_OUT = Path("recordings/data.parquet")
 DEFAULT_REPO = "fracapuano/quest-poses"
+DEFAULT_FILENAME = "data.parquet"
 DEFAULT_FPS = 30
 DEFAULT_DURATION_S = 30.0
+DEFAULT_START_DELAY_S = 3.0
 STALE_AFTER_S = 0.5  # if no new frame for a side in this long → mark not visible
 
 
@@ -107,7 +113,29 @@ class _LatestFrames:
             return dict(self._latest), dict(self._recv_ns)
 
 
-def _stream_into(latest: _LatestFrames, client: HTSClient, stop: threading.Event) -> None:
+class _StreamError:
+    """Thread-safe holder for startup/streaming failures."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._exception: BaseException | None = None
+
+    def set(self, exc: BaseException) -> None:
+        with self._lock:
+            self._exception = exc
+
+    def get(self) -> BaseException | None:
+        with self._lock:
+            return self._exception
+
+
+def _stream_into(
+    latest: _LatestFrames,
+    client: HTSClient,
+    stop: threading.Event,
+    error: _StreamError,
+    address: str,
+) -> None:
     """Background loop: pull events from the SDK, stash latest per side."""
     try:
         for event in client.iter_events():
@@ -115,7 +143,20 @@ def _stream_into(latest: _LatestFrames, client: HTSClient, stop: threading.Event
                 break
             if isinstance(event, HandFrame):
                 latest.update(event)
-    except Exception:
+    except OSError as exc:
+        error.set(exc)
+        if exc.errno == errno.EADDRINUSE:
+            logger.error(
+                "Cannot listen for HTS on %s: address already in use. "
+                "Stop the other process using this port, or pass a free --port "
+                "and configure the Quest streamer to send there.",
+                address,
+            )
+        else:
+            logger.exception("HTS transport failed while opening %s", address)
+        stop.set()
+    except Exception as exc:
+        error.set(exc)
         logger.exception("Streaming thread crashed")
         stop.set()
 
@@ -181,22 +222,36 @@ def _write_parquet(rows: list[dict], out: Path) -> int:
     return combined.num_rows
 
 
-def _upload(out: Path, repo: str) -> None:
+def _upload(out: Path, repo: str, filename: str) -> None:
     from huggingface_hub import HfApi
 
     api = HfApi()
     api.create_repo(repo_id=repo, repo_type="dataset", exist_ok=True)
     api.upload_file(
         path_or_fileobj=str(out),
-        path_in_repo="data.parquet",
+        path_in_repo=filename,
         repo_id=repo,
         repo_type="dataset",
     )
-    logger.info("Uploaded to https://huggingface.co/datasets/%s", repo)
+    logger.info("Uploaded %s to https://huggingface.co/datasets/%s", filename, repo)
+
+
+def _has_hf_token() -> bool:
+    if os.environ.get("HF_TOKEN"):
+        return True
+    try:
+        from huggingface_hub import get_token
+
+        return get_token() is not None
+    except Exception:
+        return Path.home().joinpath(".cache/huggingface/token").exists()
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description=__doc__)
+    parser = argparse.ArgumentParser(
+        description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
     parser.add_argument("--out", type=Path, default=DEFAULT_OUT)
     parser.add_argument("--fps", type=int, default=DEFAULT_FPS, help="frames per second")
     parser.add_argument(
@@ -205,8 +260,27 @@ def main() -> None:
         default=DEFAULT_DURATION_S,
         help="recording duration in seconds; use <= 0 to record until Ctrl+C",
     )
+    parser.add_argument(
+        "--start-delay",
+        type=float,
+        default=DEFAULT_START_DELAY_S,
+        help=(
+            "seconds to wait after the first HTS frame before recording, "
+            f"so the operator can reach neutral (default: {DEFAULT_START_DELAY_S})"
+        ),
+    )
     parser.add_argument("--repo", default=DEFAULT_REPO, help="HF dataset repo id")
+    parser.add_argument(
+        "--filename",
+        default=DEFAULT_FILENAME,
+        help=f"parquet path inside the HF dataset repo (default: {DEFAULT_FILENAME})",
+    )
     parser.add_argument("--no-upload", action="store_true")
+    parser.add_argument(
+        "--overwrite",
+        action="store_true",
+        help="Replace the local parquet before recording instead of appending to it.",
+    )
     parser.add_argument("--host", default="0.0.0.0")
     parser.add_argument("--port", type=int, default=8765)
     parser.add_argument(
@@ -220,6 +294,13 @@ def main() -> None:
         choices=["DEBUG", "INFO", "WARNING", "ERROR"],
     )
     args = parser.parse_args()
+    if args.fps <= 0:
+        parser.error("--fps must be greater than 0")
+    if args.start_delay < 0:
+        parser.error("--start-delay must be >= 0")
+    if args.filename.strip("/") == "":
+        parser.error("--filename must not be empty")
+    args.filename = args.filename.strip("/")
 
     logging.basicConfig(
         level=getattr(logging, args.log_level),
@@ -233,18 +314,33 @@ def main() -> None:
         port=args.port,
         output=StreamOutput.FRAMES,
         hand_filter=HandFilter.BOTH,
+        error_policy=ErrorPolicy.TOLERANT,
+        include_wall_time=True,
     )
     client = HTSClient(config)
     latest = _LatestFrames()
+    stream_error = _StreamError()
     stop = threading.Event()
 
-    thread = threading.Thread(target=_stream_into, args=(latest, client, stop), daemon=True)
+    if args.overwrite and args.out.exists():
+        logger.info("--overwrite: removing existing local parquet at %s", args.out)
+        args.out.unlink()
+
+    listen_address = f"{args.transport}://{args.host}:{args.port}"
+    thread = threading.Thread(
+        target=_stream_into,
+        args=(latest, client, stop, stream_error, listen_address),
+        daemon=True,
+    )
     thread.start()
-    logger.info("Listening for HTS frames on %s://%s:%d", args.transport, args.host, args.port)
+    logger.info("Listening for HTS frames on %s", listen_address)
 
     logger.info("Waiting for first hand frame from HTS...")
     try:
         if not _wait_for_first_frame(latest, stop):
+            if stream_error.get() is not None:
+                logger.warning("HTS stream failed before any hand frame arrived.")
+                return
             logger.warning("Stream ended before any hand frame arrived; nothing to record.")
             return
 
@@ -253,9 +349,19 @@ def main() -> None:
         stop.set()
         return
 
-    logger.info("First frame received; starting capture.")
+    if args.start_delay > 0:
+        logger.info(
+            "First frame received; hold neutral. Recording starts in %.1f seconds.",
+            args.start_delay,
+        )
+        stop.wait(args.start_delay)
+        if stop.is_set():
+            logger.info("Stopped during startup delay; nothing to record.")
+            return
 
-    period = 1.0 / args.fps if args.fps > 0 else 1.0
+    logger.info("Starting capture.")
+
+    period = 1.0 / args.fps
     rows: list[dict] = []
     next_tick = time.monotonic()
     last_log = time.monotonic()
@@ -295,7 +401,7 @@ def main() -> None:
             rows.append(row)
             seen_any = seen_any or row["left_visible"] or row["right_visible"]
 
-            if args.fps > 0 and time.monotonic() - last_log > 5.0:
+            if time.monotonic() - last_log > 5.0:
                 n_last = args.fps * 5
                 vis = sum(r["left_visible"] or r["right_visible"] for r in rows[-n_last:])
                 logger.info(
@@ -318,6 +424,7 @@ def main() -> None:
         logger.info("Stopping (Ctrl+C).")
     finally:
         stop.set()
+        thread.join(timeout=1.0)
 
     if end_at is not None and time.monotonic() >= end_at:
         logger.info("Recording duration elapsed.")
@@ -333,15 +440,12 @@ def main() -> None:
     if args.no_upload:
         logger.info("Skipping HF upload (--no-upload).")
         return
-    if (
-        not os.environ.get("HF_TOKEN")
-        and not Path.home().joinpath(".cache/huggingface/token").exists()
-    ):
+    if not _has_hf_token():
         logger.warning(
             "No HF token found; run `huggingface-cli login` or set HF_TOKEN. Skipping upload."
         )
         return
-    _upload(args.out, args.repo)
+    _upload(args.out, args.repo, args.filename)
 
 
 if __name__ == "__main__":

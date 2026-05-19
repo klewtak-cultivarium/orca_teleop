@@ -1,9 +1,8 @@
-"""Estimate the OrcaArm's reachable carpals-frame workspace per side.
+"""Estimate the reachable carpals-frame workspace per embodiment.
 
 Samples N random joint configurations within the URDF's position limits,
 computes FK to the carpals frame, and reports per-axis excursion from
-the side's home pose (the same ``q_home`` used by
-``scripts/teleop_arm_quest.py``).
+the side's home pose.
 
 Output informs ``orca_teleop.constants.WORKSPACE_DELTA_LIMITS_M`` — the
 per-side, per-axis asymmetric (lo, hi) clip applied to the Quest delta
@@ -17,11 +16,13 @@ Usage::
 
     python scripts/fk_workspace_sweep.py
     python scripts/fk_workspace_sweep.py --samples 500000 --seed 7
+    python scripts/fk_workspace_sweep.py --embodiment orca-panda \\
+        --plot plots/orcapanda_workspace.png
     python scripts/fk_workspace_sweep.py --animate
 
 With ``--animate``, each sampled joint config is pushed live to a
-meshcat preview of the robot while a parallel matplotlib 3D scatter
-plots the resulting carpals position in the same URDF world frame.
+viewer preview of the robot while a parallel matplotlib 3D scatter plots
+the resulting carpals position in the same URDF world frame.
 If the dot in matplotlib tracks the carpals triad in meshcat over many
 frames, the sweep is observing what the robot actually reaches.
 """
@@ -29,29 +30,127 @@ frames, the sweep is observing what the robot actually reaches.
 import argparse
 import logging
 import time
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Protocol
 
 import numpy as np
 
-from orca_teleop.orca_arm_ik import BimanualIKSolver
+from orca_teleop.orca_arm_ik import (
+    ArmIKConfig,
+    BimanualIKSolver,
+    default_orca_arm_ik_config,
+    orca_panda_right_ik_config,
+)
+from orca_teleop.orca_arm_teleop import OrcaArmTeleopConfig, OrcaArmTeleopController
 
-SIDES = ("left", "right")
-# Mirror of the home pose set in scripts/teleop_arm_quest.py — forearms
-# horizontal forward, elbows at π/2, palms down. Keep these two in sync.
-SIDE_BIAS = {
-    "left": {0: 0.6, 3: np.pi / 2, 4: -1.43},
-    "right": {0: -0.6, 3: np.pi / 2, 4: 1.43},
-}
 AXIS_LABELS = ("x_fwd", "y_left", "z_up")
 SIDE_COLOR = {"left": "tab:blue", "right": "tab:orange"}
 
 
+class SweepSink(Protocol):
+    def launch(self) -> None: ...
+
+    def update(
+        self,
+        arm_angles: dict[str, np.ndarray],
+        hand_positions: object | None = None,
+        target_Ts: dict[str, np.ndarray] | None = None,
+        operator_Ts: dict[str, np.ndarray] | None = None,
+    ) -> None: ...
+
+    def close(self) -> None: ...
+
+
+@dataclass
+class SideSweep:
+    positions: np.ndarray
+    T_home_p: np.ndarray
+    lo: np.ndarray
+    hi: np.ndarray
+    dt: float
+
+
+def _sides(ik: BimanualIKSolver) -> tuple[str, ...]:
+    return tuple(ik.arm_joint_indices.keys())
+
+
 def _build_q_home(ik: BimanualIKSolver) -> np.ndarray:
-    q_home = ik.neutral_q.copy()
-    for side, bias in SIDE_BIAS.items():
-        idx_q = ik._arm_idx_q[side]
-        for k, v in bias.items():
-            q_home[idx_q[k]] = v
-    return q_home
+    controller = OrcaArmTeleopController(
+        ik=ik,
+        config=OrcaArmTeleopConfig(active_sides=_sides(ik)),
+    )
+    return controller.q_home
+
+
+def _build_ik_config(args: argparse.Namespace) -> ArmIKConfig:
+    if args.embodiment == "orca-panda":
+        return orca_panda_right_ik_config(
+            urdf_path=args.arm_urdf_path,
+            ee_frame=args.right_ee_frame or "orcahand_right_R-Carpals_8d1f1041",
+        )
+
+    config = default_orca_arm_ik_config()
+    if args.arm_urdf_path is None:
+        return config
+    return ArmIKConfig(
+        urdf_path=args.arm_urdf_path,
+        sides=config.sides,
+        joint_names_by_side=config.joint_names_by_side,
+        ee_frame_by_side=config.ee_frame_by_side,
+    )
+
+
+def _make_sink(
+    embodiment: str,
+    *,
+    render_mode: str | None,
+    task_seed: int | None,
+) -> SweepSink:
+    if embodiment == "orca-panda":
+        from orca_teleop.sim import OrcaPandaCubeStackingSink
+
+        return OrcaPandaCubeStackingSink(
+            render_mode=render_mode,
+            seed=task_seed,
+            instant_qpos=True,
+        )
+
+    from orca_teleop.orca_arm_sink import OrcaArmMeshcatSink
+
+    return OrcaArmMeshcatSink()
+
+
+def _apply_env_home(
+    ik: BimanualIKSolver,
+    q_home: np.ndarray,
+    sink: SweepSink,
+    log: logging.Logger,
+) -> np.ndarray:
+    if not hasattr(sink, "home_arm_angles"):
+        raise ValueError("Selected viewer/sink does not expose environment home arm angles.")
+
+    env_home_arm_angles = sink.home_arm_angles
+    q = q_home.copy()
+    for side in _sides(ik):
+        if side not in env_home_arm_angles:
+            continue
+        for idx, value in zip(
+            ik.arm_joint_indices[side],
+            env_home_arm_angles[side],
+            strict=True,
+        ):
+            q[idx] = value
+    q = np.clip(q, ik._model.lowerPositionLimit, ik._model.upperPositionLimit)
+    log.info(
+        "Using environment home arm angles: %s",
+        {
+            side: np.round(env_home_arm_angles[side], 3).tolist()
+            for side in _sides(ik)
+            if side in env_home_arm_angles
+        },
+    )
+    return q
 
 
 def _log_side_stats(
@@ -65,7 +164,7 @@ def _log_side_stats(
     lo: np.ndarray,
     hi: np.ndarray,
 ) -> None:
-    rel = positions - T_home_p
+    rel = np.vstack([positions - T_home_p, np.zeros((1, 3), dtype=np.float64)])
     ax_lo = rel.min(axis=0)
     ax_hi = rel.max(axis=0)
     sym_half = np.minimum(np.abs(ax_lo), ax_hi)
@@ -101,8 +200,9 @@ def _run_fast(
     rng: np.random.Generator,
     samples: int,
     log: logging.Logger,
-) -> None:
-    for side in SIDES:
+) -> dict[str, SideSweep]:
+    results: dict[str, SideSweep] = {}
+    for side in _sides(ik):
         idx_q = ik._arm_idx_q[side]
         lo = np.array([ik._model.lowerPositionLimit[i] for i in idx_q])
         hi = np.array([ik._model.upperPositionLimit[i] for i in idx_q])
@@ -121,6 +221,14 @@ def _run_fast(
         dt = time.monotonic() - t0
 
         _log_side_stats(log, side, positions, T_home_p, samples, dt, ik, lo, hi)
+        results[side] = SideSweep(
+            positions=positions,
+            T_home_p=T_home_p,
+            lo=lo,
+            hi=hi,
+            dt=dt,
+        )
+    return results
 
 
 def _run_animated(
@@ -130,23 +238,33 @@ def _run_animated(
     samples: int,
     fps: float,
     log: logging.Logger,
+    sink: SweepSink | None = None,
+    embodiment: str = "orca-arm",
+    task_render_mode: str = "human",
+    task_seed: int | None = None,
 ) -> None:
     # Imports kept local so the fast path stays lightweight and headless.
     import matplotlib.pyplot as plt
     from mpl_toolkits.mplot3d import Axes3D  # noqa: F401  (registers 3d projection)
 
-    from orca_teleop.orca_arm_sink import OrcaArmMeshcatSink
-
-    sink = OrcaArmMeshcatSink()
-    sink.launch()
+    if sink is None:
+        sink = _make_sink(
+            embodiment,
+            render_mode=None if task_render_mode == "none" else task_render_mode,
+            task_seed=task_seed,
+        )
+        sink.launch()
 
     # Snap meshcat to the home pose so the operator sees the anchor before the sweep starts.
-    home_arm_angles = {side: np.array([q_home[i] for i in ik._arm_idx_q[side]]) for side in SIDES}
-    home_target_Ts = {side: ik.forward_kinematics_full(q_home, side) for side in SIDES}
+    sides = _sides(ik)
+    home_arm_angles = {side: np.array([q_home[i] for i in ik._arm_idx_q[side]]) for side in sides}
+    home_target_Ts = {side: ik.forward_kinematics_full(q_home, side) for side in sides}
     sink.update(home_arm_angles, target_Ts=home_target_Ts)
+    if hasattr(sink, "set_debug_target_frame_offsets"):
+        sink.set_debug_target_frame_offsets(home_target_Ts)
 
     per_side: dict[str, dict] = {}
-    for side in SIDES:
+    for side in sides:
         idx_q = ik._arm_idx_q[side]
         lo = np.array([ik._model.lowerPositionLimit[i] for i in idx_q])
         hi = np.array([ik._model.upperPositionLimit[i] for i in idx_q])
@@ -172,7 +290,7 @@ def _run_animated(
 
     scatters: dict[str, object] = {}
     current_markers: dict[str, object] = {}
-    for side in SIDES:
+    for side in sides:
         T_home_p = per_side[side]["T_home_p"]
         ax.scatter(
             [T_home_p[0]],
@@ -209,7 +327,7 @@ def _run_animated(
 
     # Pre-size axes to cover both home positions with a generous pad; rescale once
     # we know the empirical extent (so the early frames are not cramped).
-    home_xyz = np.array([per_side[s]["T_home_p"] for s in SIDES])
+    home_xyz = np.array([per_side[s]["T_home_p"] for s in sides])
     center = home_xyz.mean(axis=0)
     pad = 0.7
     ax.set_xlim(center[0] - pad, center[0] + pad)
@@ -233,7 +351,7 @@ def _run_animated(
 
         arm_angles: dict[str, np.ndarray] = {}
         target_Ts: dict[str, np.ndarray] = {}
-        for side in SIDES:
+        for side in sides:
             data = per_side[side]
             for j, i in enumerate(data["idx_q"]):
                 q[i] = data["joint_samples"][k, j]
@@ -244,7 +362,7 @@ def _run_animated(
 
         sink.update(arm_angles, target_Ts=target_Ts)
 
-        for side in SIDES:
+        for side in sides:
             pts = per_side[side]["positions"][: k + 1]
             scatters[side]._offsets3d = (pts[:, 0], pts[:, 1], pts[:, 2])
             cur = pts[-1]
@@ -258,7 +376,7 @@ def _run_animated(
 
     n_done = last_k + 1
     if n_done > 0:
-        for side in SIDES:
+        for side in sides:
             data = per_side[side]
             _log_side_stats(
                 log,
@@ -280,8 +398,112 @@ def _run_animated(
         sink.close()
 
 
+def _plot_results(
+    results: dict[str, SideSweep],
+    *,
+    output_path: Path | None,
+    show: bool,
+    max_points_per_side: int,
+    seed: int,
+    title: str,
+    log: logging.Logger,
+) -> None:
+    if output_path is None and not show:
+        return
+
+    import matplotlib.pyplot as plt
+
+    fig = plt.figure(title, figsize=(9, 8))
+    ax = fig.add_subplot(111, projection="3d")
+    ax.set_xlabel("x_fwd (m)")
+    ax.set_ylabel("y_left (m)")
+    ax.set_zlabel("z_up (m)")
+    ax.set_title(title)
+
+    rng = np.random.default_rng(seed)
+    all_points = []
+    for side, data in results.items():
+        positions = data.positions
+        if max_points_per_side > 0 and len(positions) > max_points_per_side:
+            idx = rng.choice(len(positions), size=max_points_per_side, replace=False)
+            positions = positions[np.sort(idx)]
+        all_points.append(positions)
+        color = SIDE_COLOR.get(side, None)
+        ax.scatter(
+            positions[:, 0],
+            positions[:, 1],
+            positions[:, 2],
+            c=color,
+            s=4,
+            alpha=0.25,
+            label=f"{side} samples",
+        )
+        home = data.T_home_p
+        ax.scatter(
+            [home[0]],
+            [home[1]],
+            [home[2]],
+            c=color,
+            marker="*",
+            s=260,
+            edgecolors="k",
+            linewidths=1.0,
+            label=f"{side} home",
+        )
+
+    points = np.vstack(all_points + [np.array([data.T_home_p for data in results.values()])])
+    mins = points.min(axis=0)
+    maxs = points.max(axis=0)
+    center = (mins + maxs) / 2.0
+    radius = float(np.max(maxs - mins) / 2.0)
+    radius = max(radius, 1e-3)
+    ax.set_xlim(center[0] - radius, center[0] + radius)
+    ax.set_ylim(center[1] - radius, center[1] + radius)
+    ax.set_zlim(center[2] - radius, center[2] + radius)
+    try:
+        ax.set_box_aspect((1.0, 1.0, 1.0))
+    except Exception:
+        pass
+    ax.legend(loc="upper right", fontsize=8)
+    fig.tight_layout()
+
+    if output_path is not None:
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        fig.savefig(output_path, dpi=180)
+        log.info("Saved workspace plot: %s", output_path)
+    if show:
+        plt.show()
+    else:
+        plt.close(fig)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--embodiment",
+        choices=["orca-arm", "orca-panda"],
+        default="orca-arm",
+        help="IK embodiment preset to sweep.",
+    )
+    parser.add_argument(
+        "--arm-urdf-path",
+        default=None,
+        help="URDF used by the arm IK. Defaults to the selected embodiment preset.",
+    )
+    parser.add_argument(
+        "--right-ee-frame",
+        default=None,
+        help="right-side end-effector frame name, mainly useful for OrcaPanda URDF variants.",
+    )
+    parser.add_argument(
+        "--home-source",
+        choices=["teleop", "neutral", "env"],
+        default=None,
+        help=(
+            "Home pose used as the delta origin. Defaults to env for orca-panda, "
+            "teleop for orca-arm."
+        ),
+    )
     parser.add_argument(
         "--samples",
         type=int,
@@ -301,23 +523,103 @@ def main() -> None:
         default=60.0,
         help="Target frame rate for the animated sweep (ignored without --animate).",
     )
+    parser.add_argument(
+        "--plot",
+        type=Path,
+        default=None,
+        help="Save a static 3D scatter plot of the sampled workspace to this image path.",
+    )
+    parser.add_argument(
+        "--show-plot",
+        action="store_true",
+        help="Show the static workspace plot in a matplotlib window.",
+    )
+    parser.add_argument(
+        "--plot-max-points-per-side",
+        type=int,
+        default=30_000,
+        help="Maximum sampled points per side drawn in the static plot; <=0 draws all points.",
+    )
+    parser.add_argument(
+        "--task-render-mode",
+        choices=["human", "rgb_array", "none"],
+        default="human",
+        help="Render mode for OrcaPanda animation. Fast env-home extraction uses none.",
+    )
+    parser.add_argument(
+        "--task-seed",
+        type=int,
+        default=None,
+        help="orca_sim seed when reading the OrcaPanda environment home pose.",
+    )
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.INFO, format="%(message)s")
     log = logging.getLogger(__name__)
 
-    ik = BimanualIKSolver()
-    q_home = _build_q_home(ik)
+    ik = BimanualIKSolver(ik_config=_build_ik_config(args))
+    home_source = args.home_source
+    if home_source is None:
+        home_source = "env" if args.embodiment == "orca-panda" else "teleop"
+
+    if home_source == "neutral":
+        q_home = ik.neutral_q.copy()
+    else:
+        q_home = _build_q_home(ik)
+
     rng = np.random.default_rng(args.seed)
 
     samples = args.samples
     if samples is None:
         samples = 1500 if args.animate else 100_000
 
-    if args.animate:
-        _run_animated(ik, q_home, rng, samples, args.animate_fps, log)
-    else:
-        _run_fast(ik, q_home, rng, samples, log)
+    sink: SweepSink | None = None
+    if home_source == "env":
+        if args.embodiment != "orca-panda":
+            raise ValueError(
+                "--home-source env is currently implemented for --embodiment orca-panda."
+            )
+        sink = _make_sink(
+            args.embodiment,
+            render_mode=(
+                None
+                if (not args.animate or args.task_render_mode == "none")
+                else args.task_render_mode
+            ),
+            task_seed=args.task_seed,
+        )
+        sink.launch()
+        q_home = _apply_env_home(ik, q_home, sink, log)
+
+    try:
+        if args.animate:
+            _run_animated(
+                ik,
+                q_home,
+                rng,
+                samples,
+                args.animate_fps,
+                log,
+                sink=sink,
+                embodiment=args.embodiment,
+                task_render_mode=args.task_render_mode,
+                task_seed=args.task_seed,
+            )
+            sink = None
+        else:
+            results = _run_fast(ik, q_home, rng, samples, log)
+            _plot_results(
+                results,
+                output_path=args.plot,
+                show=args.show_plot,
+                max_points_per_side=args.plot_max_points_per_side,
+                seed=args.seed,
+                title=f"FK workspace sweep — {args.embodiment} carpals",
+                log=log,
+            )
+    finally:
+        if sink is not None:
+            sink.close()
 
 
 if __name__ == "__main__":

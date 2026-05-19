@@ -29,7 +29,12 @@ _SCRIPTS_DIR = Path(__file__).resolve().parent.parent / "scripts"
 if str(_SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(_SCRIPTS_DIR))
 
-from teleop_arm_quest import SIDES, _drain_queue  # noqa: E402
+from teleop_arm_quest import (  # noqa: E402
+    SIDES,
+    MetaQuestDrainStats,
+    _drain_latest_metaquest_frames,
+    _drain_queue,
+)
 
 from orca_teleop.ingress.server import HandLandmarks, WristPose  # noqa: E402
 
@@ -70,6 +75,31 @@ def _landmark(position, *, side: str = "right", ts_ns: int = 0, rotation=None) -
         timestamp_ns=ts_ns,
         wrist_pose=_wrist_pose(position, rotation),
     )
+
+
+def test_latest_metaquest_drain_reports_inactive_and_missing_wrist() -> None:
+    q: queue.Queue = queue.Queue()
+    q.put(_landmark([0.0, 0.0, 0.0], side="left", ts_ns=1))
+    q.put(
+        HandLandmarks(
+            keypoints=np.zeros((21, 3), dtype=np.float32),
+            handedness="right",
+            timestamp_ns=2,
+            wrist_pose=None,
+        )
+    )
+    q.put(_landmark([0.1, 0.2, 0.3], side="right", ts_ns=3))
+    stats = MetaQuestDrainStats()
+
+    frames = _drain_latest_metaquest_frames(q, ("right",), stats=stats)
+
+    assert len(frames) == 1
+    assert frames[0].handedness == "right"
+    assert stats.total_items == 3
+    assert stats.by_side == {"left": 1, "right": 2}
+    assert stats.usable_by_side == {"right": 1}
+    assert stats.inactive_side == 1
+    assert stats.missing_wrist_pose == 1
 
 
 def _initial_state(*, still_window: int = 5) -> dict:

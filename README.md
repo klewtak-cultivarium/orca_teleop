@@ -21,6 +21,20 @@ uv sync --extra test --extra mediapipe
 
 This installs the package itself plus the testing tools and MediaPipe dependencies used by the demo and current package imports.
 
+For arm/Quest teleop development or external testing, install the arm extras as
+well:
+
+```bash
+uv sync --extra test --extra orca_arm
+pytest tests/
+python scripts/teleop_arm_quest.py --local --dummy --renderer meshcat
+```
+
+The arm extras pin `orca_core` and `orca_sim` to known-good Git commits in
+`pyproject.toml`, so a fresh checkout does not need sibling repositories on the
+same filesystem. Use `uv sync --frozen --extra test --extra orca_arm` when you
+want to verify the committed lockfile exactly.
+
 Steer your own ORCA hand using just your webcam:
 
 ```
@@ -44,7 +58,31 @@ Quest ingress path:
 2. `orca_teleop.ingress.server.IngressServer` receives those poses as `HandLandmarks`.
 3. `_wrist_pose_to_robot_se3(...)` converts Quest Unity coordinates to robot FLU.
 4. `_drain_queue(...)` (1) anchors the operator's first stable wrist pose, (2) optionally auto-fits translation scale, (3) maps operator deltas onto the robot home carpals pose, to produce absolute `pin.SE3` IK targets.
-5. `BimanualIKSolver` solves those targets and `OrcaArmMeshcatSink` visualizes the result.
+5. `BimanualIKSolver` solves those targets and the selected viewer sink visualizes the result.
+
+By default the arm teleop script renders in Meshcat. To render the same solved
+arm/hand state in MuJoCo instead, pass `--renderer mujoco`; for example:
+
+```bash
+python scripts/teleop_arm_quest.py --local --dummy --renderer mujoco
+```
+
+For the right-hand OrcaPanda embodiment, force the Meshcat sink and keep the
+teleop anchor at the `orca_sim` reset keyframe (`orcapanda_home`) with:
+
+```bash
+python scripts/teleop_arm_quest.py --embodiment orca-panda --renderer meshcat --home-pose-source env
+```
+
+Add `--local --dummy` to replay the sample Quest stream locally while testing.
+
+The arm path defaults to damped least-squares IK (`--ik-mode position`) that
+prioritizes carpals translation and softly tracks only the X/Z rotation axes
+(`--position-rotation-axes XZ`), leaving Y free. The default
+`--position-rotation-gain 3e-6` is intentionally conservative because it trades
+meters of position error against radians of angular error. Pass an empty
+`--position-rotation-axes ""` for pure position-only tracking. The older Pink
+pose task remains available with `--ik-mode pose`.
 
 Tests always run on CI. Run the regression suite from the repository root with:
 

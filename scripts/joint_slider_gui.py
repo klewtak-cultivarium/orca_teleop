@@ -1,7 +1,7 @@
-"""matplotlib sliders for the OrcaArm joints, live-driving the meshcat preview.
+"""matplotlib sliders for the OrcaArm joints, live-driving the viewer preview.
 
 Drag any of the 10 sliders (5 joints × 2 sides) to update the robot pose
-and the wrist target triads in meshcat. The status line shows where each
+and the wrist target triads in the selected viewer. The status line shows where each
 carpals frame lands and how aligned the fingers/palm axes are with
 forward/down (both in [-1, +1]; +1 = perfectly aligned).
 
@@ -11,6 +11,7 @@ forward/down (both in [-1, +1]; +1 = perfectly aligned).
 Usage:
 
     .venv/bin/python scripts/joint_slider_gui.py
+    .venv/bin/python scripts/joint_slider_gui.py --renderer mujoco
 """
 
 import matplotlib.pyplot as plt
@@ -18,14 +19,25 @@ import numpy as np
 from matplotlib.widgets import Button, Slider
 
 from orca_teleop.orca_arm_ik import BimanualIKSolver
-from orca_teleop.orca_arm_sink import OrcaArmMeshcatSink
+from orca_teleop.orca_arm_sink import OrcaArmMeshcatSink, OrcaArmMujocoSink
 
 SIDES = ("left", "right")
 
 
 def main() -> None:
+    import argparse
+
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--renderer",
+        choices=["meshcat", "mujoco"],
+        default="meshcat",
+        help="viewer backend for the slider preview (default: meshcat)",
+    )
+    args = parser.parse_args()
+
     ik = BimanualIKSolver()
-    sink = OrcaArmMeshcatSink()
+    sink = OrcaArmMujocoSink() if args.renderer == "mujoco" else OrcaArmMeshcatSink()
     sink.launch()
     q = ik.neutral_q.copy()
 

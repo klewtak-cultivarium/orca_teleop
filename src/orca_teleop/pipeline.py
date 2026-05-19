@@ -488,6 +488,9 @@ def adapter_worker(
         _shutdown_queue(queues.actions_q)
 
 
+retargeter_worker = adapter_worker
+
+
 def robot_worker(
     queues: TeleopQueues,
     stop_event: threading.Event,
