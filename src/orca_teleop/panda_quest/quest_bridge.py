@@ -163,6 +163,13 @@ class QuestTelemetryBridge:
     def wait_until_connected(self, timeout: float | None = None) -> bool:
         return self._connected.wait(timeout)
 
+    def get_last_telemetry_payload(self) -> dict[str, Any] | None:
+        return (
+            None
+            if self._last_telemetry_payload is None
+            else copy.deepcopy(self._last_telemetry_payload)
+        )
+
     def start(self) -> None:
         if self._thread is not None:
             return
