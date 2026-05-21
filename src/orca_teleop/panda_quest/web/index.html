@@ -1,0 +1,23 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Orca Panda Quest Teleop</title>
+    <link rel="stylesheet" href="/style.css" />
+  </head>
+  <body>
+    <main class="shell">
+      <section class="panel">
+        <p class="eyebrow">Meta Quest + MuJoCo</p>
+        <h1>Panda Teleop Probe</h1>
+        <p class="lede">Streams Quest controller pose to the host. Watch the MuJoCo viewer on the host machine.</p>
+        <button id="start-button" class="primary">Start Controller Teleop</button>
+        <p id="status" class="status">Idle</p>
+      </section>
+    </main>
+    <video id="remote-video" autoplay playsinline muted></video>
+    <canvas id="xr-canvas"></canvas>
+    <script src="/app.js"></script>
+  </body>
+</html>
