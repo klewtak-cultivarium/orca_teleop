@@ -9,16 +9,19 @@ import logging
 import queue
 import threading
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 import numpy as np
+import orca_core
 from orca_core import OrcaJointPositions
-from orca_sim.envs import RENDER_FPS, BaseOrcaHandEnv
+from orca_sim.envs import BaseOrcaHandEnv
 
 from orca_teleop.pipeline import _SHUTDOWN, RecordableSink
 from orca_teleop.utils import RateTicker
 
 logger = logging.getLogger(__name__)
+DEFAULT_RENDER_FPS = 30
 
 
 @dataclass(frozen=True)
@@ -50,9 +53,10 @@ class OrcaHandSimSink(RecordableSink):
         self._env: BaseOrcaHandEnv = None
         self._actuator_joint_names: list[str] = []
         self._last_action: OrcaJointPositions | None = None
-        self._dt: float = 1.0 / RENDER_FPS
+        self._dt: float = 1.0 / DEFAULT_RENDER_FPS
         self._renderer: Any | None = None
         self._record_camera: Any | None = None
+        self._retarget_model_path: str | None = None
 
     def connect(self) -> None:
         import mujoco
@@ -71,13 +75,14 @@ class OrcaHandSimSink(RecordableSink):
         env.reset()
 
         self._env = env
+        self._retarget_model_path = self._resolve_retarget_model_path(getattr(env, "version", None))
 
         self._actuator_joint_names = list(env.hand.config.joint_ids)
 
         # Hold neutral pose until the first retargeted command arrives.
         self._last_action = OrcaJointPositions(env.hand.config.neutral_position)
 
-        self._dt = 1.0 / float(env.metadata.get("render_fps", RENDER_FPS))
+        self._dt = 1.0 / float(env.metadata.get("render_fps", DEFAULT_RENDER_FPS))
 
         self._renderer = mujoco.Renderer(
             env.model,
@@ -99,6 +104,10 @@ class OrcaHandSimSink(RecordableSink):
     @property
     def joint_ids(self) -> list[str]:
         return list(self._actuator_joint_names)
+
+    @property
+    def retarget_model_path(self) -> str | None:
+        return self._retarget_model_path
 
     @property
     def camera_shapes(self) -> dict[str, tuple[int, int, int]]:
@@ -187,3 +196,15 @@ class OrcaHandSimSink(RecordableSink):
     def _to_action_array(self, positions: OrcaJointPositions) -> np.ndarray:
         # Retargeter outputs degrees; MuJoCo accepts radians
         return np.deg2rad(positions.as_array(self._actuator_joint_names))
+
+    def _resolve_retarget_model_path(self, version: str | None) -> str | None:
+        if not version:
+            return None
+        model_path = (
+            Path(orca_core.__file__).resolve().parent
+            / "models"
+            / version
+            / f"orcahand_{self._env_name}"
+            / "config.yaml"
+        )
+        return str(model_path) if model_path.exists() else None
