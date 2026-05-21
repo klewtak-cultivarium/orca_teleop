@@ -29,7 +29,18 @@ avp = [
     "avp-stream>=1.0,<2.0",
 ]
 metaquest = [
-    # Add metaquest-related dependencies here
+    "aiohttp>=3.10",
+    "aiortc>=1.9",
+]
+panda-quest = [
+    "aiohttp>=3.10",
+    "aiortc>=1.9",
+    "huggingface-hub>=0.23",
+    "mujoco>=3.1",
+    "pyarrow>=15",
+]
+lerobot = [
+    "lerobot>=0.4",
 ]
 manus = [
     # Add manus pro-related dependencies here
@@ -44,7 +55,10 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/orca_teleop"]
-artifacts = ["src/orca_teleop/ingress/*.proto"]
+artifacts = [
+    "src/orca_teleop/ingress/*.proto",
+    "src/orca_teleop/panda_quest/web/*",
+]
 
 [tool.hatch.build.targets.sdist]
 include = [
