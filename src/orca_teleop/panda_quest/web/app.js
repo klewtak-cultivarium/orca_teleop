@@ -6,6 +6,7 @@ let session = null;
 let refSpace = null;
 let gl = null;
 let xrLayer = null;
+let xrSessionMode = null;
 let pc = null;
 let telemetryChannel = null;
 let controlChannel = null;
@@ -16,6 +17,33 @@ let telemetryPacketCount = 0;
 const TARGET_TELEMETRY_HZ = 30;
 const MAX_TELEMETRY_BUFFERED_AMOUNT = 128 * 1024;
 const DEFAULT_ICE_SERVERS = [{ urls: ["stun:stun.l.google.com:19302"] }];
+const WEBXR_HAND_JOINTS = [
+  "wrist",
+  "thumb-metacarpal",
+  "thumb-phalanx-proximal",
+  "thumb-phalanx-distal",
+  "thumb-tip",
+  "index-finger-metacarpal",
+  "index-finger-phalanx-proximal",
+  "index-finger-phalanx-intermediate",
+  "index-finger-phalanx-distal",
+  "index-finger-tip",
+  "middle-finger-metacarpal",
+  "middle-finger-phalanx-proximal",
+  "middle-finger-phalanx-intermediate",
+  "middle-finger-phalanx-distal",
+  "middle-finger-tip",
+  "ring-finger-metacarpal",
+  "ring-finger-phalanx-proximal",
+  "ring-finger-phalanx-intermediate",
+  "ring-finger-phalanx-distal",
+  "ring-finger-tip",
+  "pinky-finger-metacarpal",
+  "pinky-finger-phalanx-proximal",
+  "pinky-finger-phalanx-intermediate",
+  "pinky-finger-phalanx-distal",
+  "pinky-finger-tip",
+];
 
 function setStatus(message) {
   STATUS.textContent = message;
@@ -61,6 +89,37 @@ function collectControllerTelemetry(frame, inputSource, referenceSpace) {
   };
 }
 
+function collectHandTelemetry(frame, inputSource, referenceSpace) {
+  if (!inputSource.hand || !inputSource.handedness) {
+    return null;
+  }
+
+  const wristJoint = inputSource.hand.get("wrist");
+  const wristPose = wristJoint ? frame.getJointPose(wristJoint, referenceSpace) : null;
+  if (!wristPose) {
+    return null;
+  }
+
+  const landmarks = [];
+  for (const jointName of WEBXR_HAND_JOINTS) {
+    const jointSpace = inputSource.hand.get(jointName);
+    const jointPose = jointSpace ? frame.getJointPose(jointSpace, referenceSpace) : null;
+    if (!jointPose) {
+      return null;
+    }
+    landmarks.push([
+      jointPose.transform.position.x,
+      jointPose.transform.position.y,
+      jointPose.transform.position.z,
+    ]);
+  }
+
+  return {
+    wrist: matrixToArray(wristPose.transform.matrix),
+    landmarks,
+  };
+}
+
 async function negotiatePeerConnection() {
   pc = new RTCPeerConnection({ iceServers: DEFAULT_ICE_SERVERS });
   telemetryChannel = pc.createDataChannel("telemetry", { ordered: false, maxRetransmits: 0 });
@@ -73,7 +132,7 @@ async function negotiatePeerConnection() {
   };
 
   telemetryChannel.onopen = () => {
-    setStatus("Telemetry channel open. Hold the right controller trigger to drive the arm.");
+    setStatus("Telemetry channel open. Quest poses are streaming to the host.");
     reportClientDebug("telemetry-channel-open", "Telemetry data channel opened.");
   };
   telemetryChannel.onclose = () => {
@@ -129,6 +188,11 @@ function sendTelemetry(frame, pose, referenceSpace, nowMs) {
     if (controllerTelemetry) {
       payload.controllers[inputSource.handedness] = controllerTelemetry;
     }
+
+    const handTelemetry = collectHandTelemetry(frame, inputSource, referenceSpace);
+    if (handTelemetry) {
+      payload.hands[inputSource.handedness] = handTelemetry;
+    }
   }
 
   telemetryChannel.send(JSON.stringify(payload));
@@ -138,6 +202,7 @@ function sendTelemetry(frame, pose, referenceSpace, nowMs) {
     reportClientDebug("telemetry-sent", `Sent telemetry packet ${telemetryPacketCount}.`, {
       input_source_count: session?.inputSources?.length ?? 0,
       controller_sides: Object.keys(payload.controllers),
+      hand_sides: Object.keys(payload.hands),
     });
   }
 }
@@ -151,8 +216,22 @@ function onXrFrame(nowMs, frame) {
   sendTelemetry(frame, pose, refSpace, nowMs);
 
   gl.bindFramebuffer(gl.FRAMEBUFFER, xrLayer.framebuffer);
-  gl.clearColor(0.0, 0.0, 0.0, 1.0);
+  if (xrSessionMode === "immersive-ar") {
+    gl.clearColor(0.0, 0.0, 0.0, 0.0);
+  } else {
+    gl.clearColor(0.02, 0.04, 0.10, 1.0);
+  }
   gl.clear(gl.COLOR_BUFFER_BIT);
+}
+
+async function selectXrSessionMode() {
+  if (await navigator.xr.isSessionSupported("immersive-ar")) {
+    return "immersive-ar";
+  }
+  if (await navigator.xr.isSessionSupported("immersive-vr")) {
+    return "immersive-vr";
+  }
+  throw new Error("This browser supports neither immersive-ar nor immersive-vr.");
 }
 
 async function startImmersiveSession() {
@@ -162,19 +241,24 @@ async function startImmersiveSession() {
   if (!navigator.xr) {
     throw new Error("WebXR is unavailable here. Use Quest Browser on the headset.");
   }
-  const supported = await navigator.xr.isSessionSupported("immersive-vr");
-  if (!supported) {
-    throw new Error("This browser does not support immersive-vr.");
-  }
 
-  setStatus("Requesting VR session...");
-  session = await navigator.xr.requestSession("immersive-vr", {
-    optionalFeatures: ["local-floor"],
+  xrSessionMode = await selectXrSessionMode();
+  setStatus(`Requesting ${xrSessionMode} session...`);
+  session = await navigator.xr.requestSession(xrSessionMode, {
+    optionalFeatures: ["local-floor", "hand-tracking"],
   });
-  gl = CANVAS.getContext("webgl", { xrCompatible: true });
-  xrLayer = new XRWebGLLayer(session, gl);
+  gl = CANVAS.getContext("webgl", {
+    alpha: xrSessionMode === "immersive-ar",
+    xrCompatible: true,
+  });
+  xrLayer = new XRWebGLLayer(session, gl, {
+    alpha: xrSessionMode === "immersive-ar",
+  });
   session.updateRenderState({ baseLayer: xrLayer });
-  reportClientDebug("xr-session-started", "Started VR controller telemetry session.");
+  reportClientDebug(
+    "xr-session-started",
+    `Started ${xrSessionMode} controller/hand telemetry session.`,
+  );
   await sendSessionConfig();
 
   try {
@@ -186,10 +270,11 @@ async function startImmersiveSession() {
   session.addEventListener("end", () => {
     setStatus("XR session ended.");
     session = null;
+    xrSessionMode = null;
   });
 
   await negotiatePeerConnection();
-  setStatus("XR session started. Waiting for controller telemetry...");
+  setStatus("XR session started. Waiting for Quest telemetry...");
   session.requestAnimationFrame(onXrFrame);
 }
 
