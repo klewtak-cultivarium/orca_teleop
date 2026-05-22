@@ -7,16 +7,15 @@ let refSpace = null;
 let gl = null;
 let xrLayer = null;
 let xrSessionMode = null;
-let pc = null;
-let telemetryChannel = null;
-let controlChannel = null;
+let socket = null;
+let reconnectTimer = null;
 let lastTelemetrySentAtMs = -Infinity;
-let lastTelemetryReadyState = null;
+let lastSocketReadyState = null;
 let telemetryPacketCount = 0;
 
 const TARGET_TELEMETRY_HZ = 30;
 const MAX_TELEMETRY_BUFFERED_AMOUNT = 128 * 1024;
-const DEFAULT_ICE_SERVERS = [{ urls: ["stun:stun.l.google.com:19302"] }];
+const RECONNECT_DELAY_MS = 750;
 const WEBXR_HAND_JOINTS = [
   "wrist",
   "thumb-metacarpal",
@@ -120,58 +119,60 @@ function collectHandTelemetry(frame, inputSource, referenceSpace) {
   };
 }
 
-async function negotiatePeerConnection() {
-  pc = new RTCPeerConnection({ iceServers: DEFAULT_ICE_SERVERS });
-  telemetryChannel = pc.createDataChannel("telemetry", { ordered: false, maxRetransmits: 0 });
-  controlChannel = pc.createDataChannel("control");
-  telemetryChannel.bufferedAmountLowThreshold = Math.floor(MAX_TELEMETRY_BUFFERED_AMOUNT / 2);
-
-  pc.onconnectionstatechange = () => {
-    setStatus(`WebRTC connection: ${pc.connectionState}`);
-    reportClientDebug("pc-connection-state", `RTCPeerConnection state changed to ${pc.connectionState}.`);
-  };
-
-  telemetryChannel.onopen = () => {
-    setStatus("Telemetry channel open. Quest poses are streaming to the host.");
-    reportClientDebug("telemetry-channel-open", "Telemetry data channel opened.");
-  };
-  telemetryChannel.onclose = () => {
-    reportClientDebug("telemetry-channel-close", "Telemetry data channel closed.");
-  };
-  controlChannel.onopen = () => {
-    reportClientDebug("control-channel-open", "Control channel opened.");
-  };
-
-  const offer = await pc.createOffer();
-  await pc.setLocalDescription(offer);
-
-  const response = await fetch("/offer", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ sdp: offer.sdp, type: offer.type }),
-  });
-  if (!response.ok) {
-    throw new Error(`Offer failed with ${response.status}`);
+function connectTelemetrySocket() {
+  if (reconnectTimer !== null) {
+    clearTimeout(reconnectTimer);
+    reconnectTimer = null;
   }
+  const wsProtocol = window.location.protocol === "https:" ? "wss:" : "ws:";
+  const wsUrl = `${wsProtocol}//${window.location.host}/ws`;
+  socket = new WebSocket(wsUrl);
 
-  const answer = await response.json();
-  await pc.setRemoteDescription(answer);
+  socket.onopen = () => {
+    setStatus("Telemetry WebSocket connected. Quest poses are streaming to the host.");
+    reportClientDebug("telemetry-socket-open", `WebSocket connected to ${wsUrl}.`);
+  };
+  socket.onclose = (event) => {
+    reportClientDebug(
+      "telemetry-socket-close",
+      `WebSocket closed (code=${event.code}, reason=${event.reason || "n/a"}). Reconnecting.`,
+    );
+    setStatus("Telemetry WebSocket closed; reconnecting...");
+    socket = null;
+    if (reconnectTimer === null) {
+      reconnectTimer = setTimeout(() => {
+        reconnectTimer = null;
+        connectTelemetrySocket();
+      }, RECONNECT_DELAY_MS);
+    }
+  };
+  socket.onerror = (event) => {
+    reportClientDebug(
+      "telemetry-socket-error",
+      event && event.message ? event.message : "WebSocket error",
+      null,
+      "warning",
+    );
+  };
 }
 
 function sendTelemetry(frame, pose, referenceSpace, nowMs) {
-  if (!telemetryChannel || telemetryChannel.readyState !== "open") {
-    const readyState = telemetryChannel ? telemetryChannel.readyState : "missing";
-    if (readyState !== lastTelemetryReadyState) {
-      lastTelemetryReadyState = readyState;
-      reportClientDebug("telemetry-not-ready", "Telemetry channel is not open.", { ready_state: readyState });
+  if (!socket || socket.readyState !== WebSocket.OPEN) {
+    const readyState = socket ? socket.readyState : "missing";
+    if (readyState !== lastSocketReadyState) {
+      lastSocketReadyState = readyState;
+      reportClientDebug("telemetry-socket-not-ready", "WebSocket is not open.", {
+        ready_state: readyState,
+      });
     }
     return;
   }
+  lastSocketReadyState = socket.readyState;
 
   if (nowMs - lastTelemetrySentAtMs < 1000.0 / TARGET_TELEMETRY_HZ) {
     return;
   }
-  if (telemetryChannel.bufferedAmount > MAX_TELEMETRY_BUFFERED_AMOUNT) {
+  if (socket.bufferedAmount > MAX_TELEMETRY_BUFFERED_AMOUNT) {
     return;
   }
 
@@ -195,7 +196,7 @@ function sendTelemetry(frame, pose, referenceSpace, nowMs) {
     }
   }
 
-  telemetryChannel.send(JSON.stringify(payload));
+  socket.send(JSON.stringify(payload));
   lastTelemetrySentAtMs = nowMs;
   telemetryPacketCount += 1;
   if (telemetryPacketCount <= 3) {
@@ -236,7 +237,9 @@ async function selectXrSessionMode() {
 
 async function startImmersiveSession() {
   if (!window.isSecureContext) {
-    throw new Error("Open this page over HTTPS in Quest Browser. An ngrok HTTPS URL is the quickest path.");
+    throw new Error(
+      "Open this page over HTTPS (or http://localhost via adb reverse) in Quest Browser.",
+    );
   }
   if (!navigator.xr) {
     throw new Error("WebXR is unavailable here. Use Quest Browser on the headset.");
@@ -271,9 +274,17 @@ async function startImmersiveSession() {
     setStatus("XR session ended.");
     session = null;
     xrSessionMode = null;
+    if (socket) {
+      socket.close();
+      socket = null;
+    }
+    if (reconnectTimer !== null) {
+      clearTimeout(reconnectTimer);
+      reconnectTimer = null;
+    }
   });
 
-  await negotiatePeerConnection();
+  connectTelemetrySocket();
   setStatus("XR session started. Waiting for Quest telemetry...");
   session.requestAnimationFrame(onXrFrame);
 }

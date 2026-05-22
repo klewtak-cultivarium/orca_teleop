@@ -129,10 +129,12 @@ class QuestTelemetryState:
 
 
 class QuestTelemetryBridge:
-    """Small WebXR/WebRTC host for Quest controller telemetry.
+    """WebXR signaling + WebSocket telemetry bridge for Quest input.
 
-    This intentionally stays telemetry-only. MuJoCo rendering remains on the host
-    viewer so the first Panda experiment has as few moving parts as possible.
+    Telemetry runs over a persistent WebSocket on the same aiohttp server, so
+    the full pipe (page load + telemetry) goes through one TCP connection.
+    That makes USB tunneling via ``adb reverse tcp:8765 tcp:8765`` work end to
+    end and removes the WebRTC ICE/consent failure modes from the equation.
     """
 
     def __init__(
@@ -146,7 +148,6 @@ class QuestTelemetryBridge:
         self.ssl_context = ssl_context
         self.state = QuestTelemetryState()
 
-        self._pc: Any | None = None
         self._loop: asyncio.AbstractEventLoop | None = None
         self._thread: threading.Thread | None = None
         self._runner: Any | None = None
@@ -154,6 +155,7 @@ class QuestTelemetryBridge:
         self._started = threading.Event()
         self._last_telemetry_payload: dict[str, Any] | None = None
         self._telemetry_packet_count = 0
+        self._websockets: set[Any] = set()
 
     @property
     def url(self) -> str:
@@ -209,7 +211,7 @@ class QuestTelemetryBridge:
         app.router.add_get("/config.json", self._handle_config)
         app.router.add_get("/app.js", self._handle_app_js)
         app.router.add_get("/style.css", self._handle_style_css)
-        app.router.add_post("/offer", self._handle_offer)
+        app.router.add_get("/ws", self._handle_ws)
         app.router.add_post("/session-config", self._handle_session_config)
         app.router.add_post("/debug/client-log", self._handle_debug_client_log)
 
@@ -219,9 +221,9 @@ class QuestTelemetryBridge:
         await site.start()
 
     async def _async_shutdown(self) -> None:
-        if self._pc is not None:
-            await self._pc.close()
-            self._pc = None
+        for ws in list(self._websockets):
+            await ws.close()
+        self._websockets.clear()
         if self._runner is not None:
             await self._runner.cleanup()
             self._runner = None
@@ -271,58 +273,51 @@ class QuestTelemetryBridge:
         print(f"[QuestClient/{level}] {event}: {message}", flush=True)
         return web.json_response({"ok": True})
 
-    async def _handle_offer(self, request: Any) -> Any:
-        from aiohttp import web
-        from aiortc import RTCConfiguration, RTCIceServer, RTCPeerConnection, RTCSessionDescription
+    async def _handle_ws(self, request: Any) -> Any:
+        from aiohttp import WSMsgType, web
 
-        params = await request.json()
-        offer = RTCSessionDescription(sdp=params["sdp"], type=params["type"])
+        ws = web.WebSocketResponse(heartbeat=10.0, max_msg_size=4 * 1024 * 1024)
+        await ws.prepare(request)
+        self._websockets.add(ws)
+        peer = request.remote
+        print(f"Quest telemetry WebSocket opened from {peer}.", flush=True)
 
-        if self._pc is not None:
-            await self._pc.close()
+        try:
+            async for msg in ws:
+                if msg.type == WSMsgType.TEXT:
+                    try:
+                        payload = json.loads(msg.data)
+                    except json.JSONDecodeError:
+                        continue
+                    self._dispatch_payload(payload, transport=f"ws:{peer}")
+                elif msg.type == WSMsgType.ERROR:
+                    print(
+                        f"Quest telemetry WebSocket error: {ws.exception()!r}",
+                        flush=True,
+                    )
+                    break
+        finally:
+            self._websockets.discard(ws)
+            print(f"Quest telemetry WebSocket closed from {peer}.", flush=True)
+            self._connected.clear()
 
-        pc = RTCPeerConnection(
-            configuration=RTCConfiguration(
-                iceServers=[RTCIceServer(urls=["stun:stun.l.google.com:19302"])]
-            )
-        )
-        self._pc = pc
-        self._connected.clear()
+        return ws
 
-        @pc.on("datachannel")
-        def on_datachannel(channel: Any) -> None:
-            print(f"Data channel opened: {channel.label}", flush=True)
-
-            @channel.on("message")
-            def on_message(message: Any) -> None:
-                if not isinstance(message, str):
-                    return
+    def _dispatch_payload(self, payload: Mapping[str, Any], *, transport: str) -> None:
+        payload_type = payload.get("type")
+        if payload_type == "telemetry":
+            self._ingest_telemetry(payload, transport=transport)
+            return
+        if payload_type == "control_event":
+            event_name = payload.get("event")
+            if isinstance(event_name, str):
                 try:
-                    payload = json.loads(message)
-                except json.JSONDecodeError:
-                    return
-
-                payload_type = payload.get("type")
-                if payload_type == "telemetry":
-                    self._ingest_telemetry(payload, transport=f"datachannel:{channel.label}")
-                    return
-
-                if payload_type == "control_event":
-                    event_name = payload.get("event")
-                    if isinstance(event_name, str):
-                        self.state.push_event(event_name)
-                    return
-
-        @pc.on("connectionstatechange")
-        async def on_connectionstatechange() -> None:
-            print(f"Peer connection state changed: {pc.connectionState}", flush=True)
-            if pc.connectionState in {"failed", "closed", "disconnected"}:
-                self._connected.clear()
-
-        await pc.setRemoteDescription(offer)
-        answer = await pc.createAnswer()
-        await pc.setLocalDescription(answer)
-        return web.json_response({"sdp": pc.localDescription.sdp, "type": pc.localDescription.type})
+                    self.state.push_event(event_name)
+                except KeyError:
+                    print(
+                        f"Ignoring unknown Quest control event {event_name!r}.",
+                        flush=True,
+                    )
 
     def _ingest_telemetry(self, payload: Mapping[str, Any], *, transport: str) -> None:
         self.state.update(payload)
