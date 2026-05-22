@@ -29,6 +29,57 @@ def xr_matrix_to_mujoco_matrix(raw_matrix: Sequence[float]) -> np.ndarray:
     return mujoco_matrix
 
 
+def xr_points_to_mujoco_points(points: np.ndarray) -> np.ndarray:
+    points = np.asarray(points, dtype=np.float64)
+    if points.ndim != 2 or points.shape[1] != 3:
+        raise ValueError(f"Expected XR points with shape (N, 3), got {points.shape}.")
+    return points @ XR_TO_MUJOCO_BASIS.T
+
+
+def _normalized(vector: np.ndarray, *, name: str) -> np.ndarray:
+    norm = float(np.linalg.norm(vector))
+    if norm < 1e-8:
+        raise ValueError(f"Cannot build palm frame; {name} axis is degenerate.")
+    return vector / norm
+
+
+def webxr_palm_matrix_to_mujoco_matrix(
+    landmarks: np.ndarray,
+    *,
+    wrist_translation: np.ndarray | None = None,
+) -> np.ndarray:
+    """Build a MuJoCo-frame palm pose from WebXR hand landmarks.
+
+    WebXR wrist joint orientation is not a palm-plane convention. For arm IK we
+    instead derive a frame from hand geometry: x is ring-to-index, y is
+    wrist-to-middle, and z is the palm normal.
+    """
+    landmarks_mujoco = xr_points_to_mujoco_points(np.asarray(landmarks, dtype=np.float64))
+    if landmarks_mujoco.shape != (25, 3):
+        raise ValueError(
+            f"Expected WebXR hand landmarks with shape (25, 3), got {landmarks_mujoco.shape}."
+        )
+
+    wrist = landmarks_mujoco[0]
+    index_base = landmarks_mujoco[5]
+    middle_base = landmarks_mujoco[10]
+    ring_base = landmarks_mujoco[15]
+
+    y_axis = _normalized(middle_base - wrist, name="wrist-to-middle")
+    x_axis = index_base - ring_base
+    x_axis = _normalized(x_axis - np.dot(x_axis, y_axis) * y_axis, name="ring-to-index")
+    z_axis = _normalized(np.cross(x_axis, y_axis), name="palm-normal")
+    y_axis = _normalized(np.cross(z_axis, x_axis), name="orthogonalized wrist-to-middle")
+
+    translation = (
+        wrist if wrist_translation is None else np.asarray(wrist_translation, dtype=np.float64)
+    )
+    return make_transform(
+        np.column_stack([x_axis, y_axis, z_axis]),
+        translation,
+    )
+
+
 def make_transform(rotation: np.ndarray, translation: np.ndarray) -> np.ndarray:
     transform = np.eye(4, dtype=np.float64)
     transform[:3, :3] = rotation
