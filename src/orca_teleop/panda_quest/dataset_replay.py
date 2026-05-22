@@ -16,6 +16,79 @@ UNITY_LEFT_TO_FLU = np.array(
     ],
     dtype=np.float64,
 )
+WEBXR_HAND_JOINT_NAMES = (
+    "wrist",
+    "thumb-metacarpal",
+    "thumb-phalanx-proximal",
+    "thumb-phalanx-distal",
+    "thumb-tip",
+    "index-finger-metacarpal",
+    "index-finger-phalanx-proximal",
+    "index-finger-phalanx-intermediate",
+    "index-finger-phalanx-distal",
+    "index-finger-tip",
+    "middle-finger-metacarpal",
+    "middle-finger-phalanx-proximal",
+    "middle-finger-phalanx-intermediate",
+    "middle-finger-phalanx-distal",
+    "middle-finger-tip",
+    "ring-finger-metacarpal",
+    "ring-finger-phalanx-proximal",
+    "ring-finger-phalanx-intermediate",
+    "ring-finger-phalanx-distal",
+    "ring-finger-tip",
+    "pinky-finger-metacarpal",
+    "pinky-finger-phalanx-proximal",
+    "pinky-finger-phalanx-intermediate",
+    "pinky-finger-phalanx-distal",
+    "pinky-finger-tip",
+)
+RETARGETER_HAND_LANDMARK_NAMES = (
+    "wrist",
+    "thumb_cmc",
+    "thumb_mcp",
+    "thumb_ip",
+    "thumb_tip",
+    "index_mcp",
+    "index_pip",
+    "index_dip",
+    "index_tip",
+    "middle_mcp",
+    "middle_pip",
+    "middle_dip",
+    "middle_tip",
+    "ring_mcp",
+    "ring_pip",
+    "ring_dip",
+    "ring_tip",
+    "pinky_mcp",
+    "pinky_pip",
+    "pinky_dip",
+    "pinky_tip",
+)
+WEBXR_TO_RETARGETER_LANDMARK_INDICES = (
+    0,  # wrist
+    1,
+    2,
+    3,
+    4,  # thumb: WebXR already has four post-wrist joints
+    5,
+    6,
+    7,
+    9,  # index: drop WebXR phalanx-distal, keep tip
+    10,
+    11,
+    12,
+    14,  # middle
+    15,
+    16,
+    17,
+    19,  # ring
+    20,
+    21,
+    22,
+    24,  # pinky
+)
 
 
 @dataclass(frozen=True)
@@ -129,8 +202,10 @@ def retargeter_landmarks_from_webxr(points: np.ndarray, side: str) -> np.ndarray
     """Adapt live WebXR hand joints to the retargeter's 21-point convention.
 
     WebXR exposes 25 joints: wrist plus four thumb joints and five joints for
-    each non-thumb finger. The retargeter expects MediaPipe's 21-point layout,
-    so this drops the extra distal phalanx joint for each non-thumb finger.
+    each non-thumb finger, ordered by ``WEBXR_HAND_JOINT_NAMES``. The retargeter
+    expects the 21-point MediaPipe/MANO-like layout in
+    ``RETARGETER_HAND_LANDMARK_NAMES`` order, so this drops WebXR's extra distal
+    phalanx joint for each non-thumb finger while preserving each fingertip.
     """
     if side not in ("left", "right"):
         raise ValueError(f"Unsupported side: {side!r}")
@@ -138,30 +213,7 @@ def retargeter_landmarks_from_webxr(points: np.ndarray, side: str) -> np.ndarray
     if landmarks_25.ndim != 2 or landmarks_25.shape != (25, 3):
         raise ValueError(f"Expected WebXR landmarks with shape (25, 3), got {landmarks_25.shape}.")
 
-    mediapipe_indices = [
-        0,
-        1,
-        2,
-        3,
-        4,
-        5,
-        6,
-        7,
-        9,
-        10,
-        11,
-        12,
-        14,
-        15,
-        16,
-        17,
-        19,
-        20,
-        21,
-        22,
-        24,
-    ]
-    landmarks = landmarks_25[mediapipe_indices].copy()
+    landmarks = landmarks_25[list(WEBXR_TO_RETARGETER_LANDMARK_INDICES)].copy()
     if side == "right":
         landmarks[:, 1] *= -1.0
     return landmarks
