@@ -11,6 +11,7 @@ from orca_teleop.panda_quest.transforms import make_transform, rotation_vector_f
 READY_ARM_QPOS = np.array([-0.1, -1.6, -0.1, -3.0718, -0.15, 2.85, -1.4027], dtype=np.float64)
 PANDA_JOINT_NAMES = tuple(f"panda_joint{idx}" for idx in range(1, 8))
 DEFAULT_CUBE_STACKING_KEYFRAME = "orcapanda_home"
+RIGHT_HAND_CARPALS_BODY = "orcahand_right_R-Carpals_8d1f1041"
 _RIGHT_HAND_SCENE_JOINT_WRIST = "orcahand_right_R-Carpals_8d1f1041_to_TopTower-Model_4a80d30e"
 _RIGHT_HAND_SCENE_JOINT_THUMB_BASE = "orcahand_right_T-TP-R_1c2b802d_to_R-Carpals_8d1f1041"
 _RIGHT_HAND_SCENE_JOINT_THUMB_ABD = "orcahand_right_R-T-AP_a9723101_to_T-TP-R_1c2b802d"
@@ -126,7 +127,7 @@ def resolve_panda_model_path(
 
 @dataclass
 class PandaIkConfig:
-    site_name: str = "attachment_site"
+    target_body_name: str = RIGHT_HAND_CARPALS_BODY
     damping: float = 0.08
     max_iters: int = 16
     step_scale: float = 0.65
@@ -143,6 +144,7 @@ class MujocoPandaArm:
         scene: str = "legacy",
         scene_path: str | None = None,
         ik_config: PandaIkConfig | None = None,
+        settle_steps: int = 0,
     ) -> None:
         import mujoco
 
@@ -175,11 +177,12 @@ class MujocoPandaArm:
             RIGHT_HAND_SCENE_JOINT_BY_V2_CANONICAL
         )
         self.joint_ranges = self.model.jnt_range[self.joint_ids].astype(np.float64)
-        self.site_id = self._site_id(self.ik_config.site_name)
+        self.target_body_id = self._body_id(self.ik_config.target_body_name)
+        self._settle_steps = int(max(0, settle_steps))
 
         self.reset(pose)
 
-    def reset(self, pose: str = "ready") -> None:
+    def reset(self, pose: str = "ready", settle_steps: int | None = None) -> None:
         if pose == "qpos0":
             self.mujoco.mj_resetData(self.model, self.data)
         elif pose == "ready":
@@ -190,6 +193,12 @@ class MujocoPandaArm:
 
         self.hold_current_qpos()
         self.mujoco.mj_forward(self.model, self.data)
+
+        n_settle = self._settle_steps if settle_steps is None else int(max(0, settle_steps))
+        if n_settle > 0:
+            self.mujoco.mj_step(self.model, self.data, nstep=n_settle)
+            self.data.qvel[:] = 0.0
+            self.mujoco.mj_forward(self.model, self.data)
 
     def _reset_keyframe(self, keyframe_name: str) -> None:
         key_id = self.mujoco.mj_name2id(
@@ -271,8 +280,8 @@ class MujocoPandaArm:
     def end_effector_matrix(self) -> np.ndarray:
         self.mujoco.mj_forward(self.model, self.data)
         return make_transform(
-            self.data.site_xmat[self.site_id].reshape(3, 3).copy(),
-            self.data.site_xpos[self.site_id].copy(),
+            self.data.xmat[self.target_body_id].reshape(3, 3).copy(),
+            self.data.xpos[self.target_body_id].copy(),
         )
 
     def solve_ik(
@@ -296,8 +305,8 @@ class MujocoPandaArm:
             self.set_arm_qpos(qpos)
             self.mujoco.mj_forward(self.model, self.data)
 
-            current_pos = self.data.site_xpos[self.site_id].copy()
-            current_rot = self.data.site_xmat[self.site_id].reshape(3, 3).copy()
+            current_pos = self.data.xpos[self.target_body_id].copy()
+            current_rot = self.data.xmat[self.target_body_id].reshape(3, 3).copy()
             pos_error = target_pos - current_pos
             rot_error = rotation_vector_from_matrix(target_rot @ current_rot.T)
             error = np.concatenate([cfg.position_gain * pos_error, cfg.rotation_gain * rot_error])
@@ -305,7 +314,7 @@ class MujocoPandaArm:
             if np.linalg.norm(error[:3]) < 0.004 and np.linalg.norm(error[3:]) < 0.035:
                 break
 
-            self.mujoco.mj_jacSite(self.model, self.data, jacp, jacr, self.site_id)
+            self.mujoco.mj_jacBody(self.model, self.data, jacp, jacr, self.target_body_id)
             jac = np.vstack([jacp[:, self.dof_ids], cfg.rotation_gain * jacr[:, self.dof_ids]])
             lhs = jac @ jac.T + (cfg.damping**2) * np.eye(6)
             delta = jac.T @ np.linalg.solve(lhs, error)
@@ -333,6 +342,12 @@ class MujocoPandaArm:
         if site_id < 0:
             raise ValueError(f"Missing site {name!r} in {self.model_path}")
         return site_id
+
+    def _body_id(self, name: str) -> int:
+        body_id = self.mujoco.mj_name2id(self.model, self.mujoco.mjtObj.mjOBJ_BODY, name)
+        if body_id < 0:
+            raise ValueError(f"Missing body {name!r} in {self.model_path}")
+        return body_id
 
     def camera_id(self, name: str) -> int:
         camera_id = self.mujoco.mj_name2id(
