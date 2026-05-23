@@ -134,6 +134,11 @@ class ManusPublisher:
 
     def run(self) -> None:
         """Start ZMQ receiver thread and gRPC stream, block until interrupted."""
+        print(
+            "\033[93mPrerequisite: run 'manus-client run' in a separate terminal before "
+            "starting the Manus teleop pipeline. The Manus SDK client must be streaming "
+            "glove data over ZMQ for this pipeline to receive frames.\033[0m"
+        )
         logger.info(
             "ManusPublisher starting (server=%s, hand=%s, zmq=%s)",
             self._server_address,
