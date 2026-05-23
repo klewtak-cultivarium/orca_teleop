@@ -33,7 +33,7 @@ MANO_LANDMARK_NAMES: tuple[str, ...] = (
 )
 
 # Manus has one additional non-thumb CMC position per finger. The teleop
-# pipeline consumes the MediaPipe/MANO-style 21-point surface, so those extra
+# pipeline consumes the MediaPipe/MANO-style 21-point surface, so extra
 # CMCs are intentionally skipped.
 MANUS_POSITION_JOINTS_FOR_MANO: tuple[str, ...] = (
     "Hand",
@@ -60,41 +60,42 @@ MANUS_POSITION_JOINTS_FOR_MANO: tuple[str, ...] = (
 )
 
 # Manus 25-joint → MANO 21-joint index mapping.
-# Manus SDK native joint order (verified against the SDK visualizer):
+# Manus SDK native raw skeleton order (thumb is LAST, not first):
 #   0       Hand root (wrist)
-#   1-4     Thumb  (CMC, MCP, IP, TIP)           — 4 joints
-#   5-9     Index  (CMC, MCP, PIP, DIP, TIP)     — 5 joints
-#   10-14   Middle (CMC, MCP, PIP, DIP, TIP)     — 5 joints
-#   15-19   Ring   (CMC, MCP, PIP, DIP, TIP)     — 5 joints
-#   20-24   Pinky  (CMC, MCP, PIP, DIP, TIP)     — 5 joints
+#   1-5     Index  (CMC, MCP, PIP, DIP, TIP)     — 5 joints
+#   6-10    Middle (CMC, MCP, PIP, DIP, TIP)     — 5 joints
+#   11-15   Ring   (CMC, MCP, PIP, DIP, TIP)     — 5 joints
+#   16-20   Pinky  (CMC, MCP, PIP, DIP, TIP)     — 5 joints
+#   21-24   Thumb  (CMC, MCP, IP, TIP)           — 4 joints
 # MANO expects: wrist, thumb(4), index(4), middle(4), ring(4), pinky(4) = 21.
-# We skip the non-thumb CMC joints at indices 5, 10, 15, 20.
-MANUS_TO_MANO = [0, 1, 2, 3, 4, 6, 7, 8, 9, 11, 12, 13, 14, 16, 17, 18, 19, 21, 22, 23, 24]
+# Also, we entirely skip the non-thumb CMC joints at indices 1, 6, 11, 16.
+MANUS_TO_MANO = [0, 21, 22, 23, 24, 2, 3, 4, 5, 7, 8, 9, 10, 12, 13, 14, 15, 17, 18, 19, 20]
 
 
 def manus_zmq_to_mano_keypoints(positions: np.ndarray) -> np.ndarray:
-    """Convert 21-joint ZMQ positions to wrist-relative MANO convention.
+    """Convert 21-joint ZMQ positions to wrist-relative keypoints.
 
-    The C++ client publishes global-frame positions in a right-handed Z-up
-    frame (X-from-viewer, Y-left, Z-up).  This function makes them
-    wrist-relative and converts to the same convention used by
-    ``manus_unity_positions_to_mano_keypoints``.
+    The native ManusClient C++ client publishes global-frame positions in a
+    right-handed Z-up frame (X-from-viewer, Y-left, Z-up) with no additional
+    transforms.  This function makes them wrist-relative and passes them
+    straight through — the retargeter's normalization step
+    (``get_normalized_local_manohand_joint_pos``) derives its own coordinate
+    frame from hand geometry, so no axis remapping is needed.
 
-    The SDK and Unity coordinate systems relate as:
-        X_unity = -Y_sdk,  Y_unity = Z_sdk,  Z_unity = X_sdk
-
-    Applying the Unity MANO formula ``(-X_u, Z_u, -Y_u)`` in SDK terms gives:
-        MANO = (Y_sdk, X_sdk, -Z_sdk)
+    The previous Sharpa-based client applied its own coordinate transforms in
+    C++, which were compensated here with a ``[Y, X, -Z]`` axis swap.  That
+    swap is commented out now that the native client forwards raw SDK data.
 
     Args:
         positions: ``(21, 3)`` array already indexed to the 21 MANO joints.
 
     Returns:
-        ``(21, 3)`` float32 array in MANO coordinates, wrist-relative, meters.
+        ``(21, 3)`` float32 array, wrist-relative, meters.
     """
     kp = np.array(positions, dtype=np.float32)
     kp = kp - kp[0:1, :]  # make wrist-relative
-    return np.stack([kp[:, 1], kp[:, 0], -kp[:, 2]], axis=-1)
+
+    return kp
 
 
 def manus_unity_positions_to_mano_keypoints(positions_cm: np.ndarray) -> np.ndarray:
