@@ -238,6 +238,7 @@ def retargeter_worker(
     stop_event: threading.Event,
     model_path: str | None = None,
     urdf_path: str | None = None,
+    landmarks_viz: Any | None = None,
 ) -> None:
     """Consume ``HandLandmarks`` from the gRPC ingress, retarget, push to actions_q.
 
@@ -269,6 +270,9 @@ def retargeter_worker(
 
             if not isinstance(item, HandLandmarks):
                 raise ValueError(f"Expected instance of HandLandmarks, got {type(item)}")
+
+            if landmarks_viz is not None:
+                landmarks_viz.put(item.keypoints, item.handedness)
 
             t_retarget_start = time.perf_counter()
             try:
@@ -347,6 +351,7 @@ def run(
     urdf_path: str | None = None,
     port: int = DEFAULT_PORT,
     sink: RobotSink | None = None,
+    visualize_landmarks: bool = False,
 ) -> None:
     """Start the full teleop pipeline:
     - gRPC-ingress -> retargeter -> robot consumer
@@ -373,6 +378,13 @@ def run(
     )
     stop_event = threading.Event()
 
+    landmarks_viz = None
+    if visualize_landmarks:
+        from orca_teleop.ingress.visualizer import HandLandmarkVisualizer
+
+        landmarks_viz = HandLandmarkVisualizer()
+        landmarks_viz.start()
+
     sink.connect()
 
     ingress_server = IngressServer(queues.landmarks_q, stop_event, port=port)
@@ -380,7 +392,7 @@ def run(
 
     retargeter_thread = threading.Thread(
         target=retargeter_worker,
-        args=(queues, stop_event, model_path, urdf_path),
+        args=(queues, stop_event, model_path, urdf_path, landmarks_viz),
         name="retargeter",
     )
     retargeter_thread.start()
@@ -394,6 +406,8 @@ def run(
         ingress_server.stop()
         retargeter_thread.join(timeout=JOIN_TIMEOUT)
         sink.close()
+        if landmarks_viz is not None:
+            landmarks_viz.stop()
 
 
 def _mediapipe_publisher(
@@ -437,6 +451,7 @@ def run_local(
     confidence: float = DEFAULT_CONFIDENCE,
     show_video: bool = False,
     sink: RobotSink | None = None,
+    visualize_landmarks: bool = False,
 ) -> None:
     """Run ``run()`` plus a local MediaPipe publisher for one-command teleop.
     Useful for prototyping.
@@ -459,7 +474,84 @@ def run_local(
     )
 
     try:
-        run(model_path=model_path, urdf_path=urdf_path, port=port, sink=sink)
+        run(
+            model_path=model_path,
+            urdf_path=urdf_path,
+            port=port,
+            sink=sink,
+            visualize_landmarks=visualize_landmarks,
+        )
+    finally:
+        if publisher_process.is_alive():
+            publisher_process.terminate()
+        publisher_process.join(timeout=3.0)
+
+
+def _manus_publisher(
+    port: int,
+    handedness: str,
+    zmq_address: str,
+) -> None:
+    """Entry point for the Manus publisher subprocess."""
+    from orca_teleop.ingress.manus.publisher import ManusPublisher
+
+    server_address = f"localhost:{port}"
+    deadline = time.monotonic() + 10.0
+
+    while True:
+        try:
+            with socket.create_connection(tuple(server_address.split(":")), timeout=0.5):
+                break
+        except OSError as err:
+            if time.monotonic() >= deadline:
+                raise RuntimeError(
+                    f"Ingress server on {server_address} did not become ready"
+                ) from err
+            time.sleep(0.1)
+
+    publisher = ManusPublisher(
+        server_address=server_address,
+        handedness=handedness,
+        zmq_address=zmq_address,
+    )
+    publisher.run()
+
+
+def run_manus_local(
+    model_path: str | None = None,
+    urdf_path: str | None = None,
+    port: int = DEFAULT_PORT,
+    handedness: str = DEFAULT_HAND,
+    zmq_address: str = "tcp://127.0.0.1:2044",
+    sink: RobotSink | None = None,
+    visualize_landmarks: bool = False,
+) -> None:
+    """Run ``run()`` plus a local Manus ZMQ→gRPC publisher for one-command teleop."""
+    import multiprocessing
+
+    publisher_process = multiprocessing.Process(
+        target=_manus_publisher,
+        args=(port, handedness, zmq_address),
+        name="manus-publisher",
+        daemon=True,
+    )
+
+    publisher_process.start()
+    logger.info(
+        "Local Manus publisher started (pid=%d, hand=%s, zmq=%s)",
+        publisher_process.pid,
+        handedness,
+        zmq_address,
+    )
+
+    try:
+        run(
+            model_path=model_path,
+            urdf_path=urdf_path,
+            port=port,
+            sink=sink,
+            visualize_landmarks=visualize_landmarks,
+        )
     finally:
         if publisher_process.is_alive():
             publisher_process.terminate()
@@ -471,7 +563,7 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser(
         description="Orca Hand teleoperation pipeline. "
-        "Launches a MediaPipe webcam publisher and the full retargeting pipeline.",
+        "Launches a publisher and the full retargeting pipeline.",
     )
     parser.add_argument("--model_path", default=None, help="OrcaHand model directory")
     parser.add_argument("--urdf_path", default=None, help="Hand URDF file")
@@ -482,9 +574,25 @@ if __name__ == "__main__":
         "--hand", default="right", choices=["left", "right"], help="Hand to track (default: right)"
     )
     parser.add_argument(
+        "--source",
+        default="mediapipe",
+        choices=["mediapipe", "manus"],
+        help="Input source (default: mediapipe)",
+    )
+    parser.add_argument(
+        "--zmq-address",
+        default="tcp://127.0.0.1:2044",
+        help="ZMQ address for Manus C++ client (default: tcp://127.0.0.1:2044)",
+    )
+    parser.add_argument(
         "--confidence", type=float, default=0.7, help="MediaPipe confidence (default: 0.7)"
     )
     parser.add_argument("--show-video", action="store_true", help="Show webcam feed with landmarks")
+    parser.add_argument(
+        "--visualize-landmarks",
+        action="store_true",
+        help="Open a live 3D matplotlib window showing hand keypoints",
+    )
     parser.add_argument(
         "--log-level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"]
     )
@@ -496,11 +604,22 @@ if __name__ == "__main__":
         datefmt="%H:%M:%S",
     )
 
-    run_local(
-        args.model_path,
-        args.urdf_path,
-        port=args.port,
-        handedness=args.hand,
-        confidence=args.confidence,
-        show_video=args.show_video,
-    )
+    if args.source == "manus":
+        run_manus_local(
+            args.model_path,
+            args.urdf_path,
+            port=args.port,
+            handedness=args.hand,
+            zmq_address=args.zmq_address,
+            visualize_landmarks=args.visualize_landmarks,
+        )
+    else:
+        run_local(
+            args.model_path,
+            args.urdf_path,
+            port=args.port,
+            handedness=args.hand,
+            confidence=args.confidence,
+            show_video=args.show_video,
+            visualize_landmarks=args.visualize_landmarks,
+        )

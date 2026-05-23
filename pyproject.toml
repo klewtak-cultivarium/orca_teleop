@@ -32,7 +32,7 @@ metaquest = [
     # Add metaquest-related dependencies here
 ]
 manus = [
-    # Add manus pro-related dependencies here
+    "pyzmq>=25.0",
 ]
 sim = [
     "orca_sim @ git+https://github.com/orcahand/orca_sim.git@main"

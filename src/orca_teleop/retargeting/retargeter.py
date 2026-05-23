@@ -189,6 +189,8 @@ class RetargeterConfig:
 
         with open(urdf_path) as f:
             urdf_text = f.read()
+        # v1 URDF uses "thumb_pip" for the joint that v2 config calls "thumb_cmc".
+        urdf_text = urdf_text.replace("thumb_pip", "thumb_cmc")
         _orig_core_on_error = _urdf_core.on_error
         _orig_xmlr_on_error = _xmlr.on_error
         _urdf_core.on_error = lambda _: None
@@ -233,10 +235,15 @@ class RetargeterConfig:
         finger_upper_urdf = finger_upper_phys - finger_ref_deg
 
         urdf_joint_names = chain.get_joint_parameter_names()
-        assert set(urdf_joint_ids) == set(urdf_joint_names), (
-            "Joint name mismatch between config.yaml and URDF — "
-            "check that hand type (left/right) is consistent and files are up to date."
-        )
+        if set(urdf_joint_ids) != set(urdf_joint_names):
+            in_config_not_urdf = set(urdf_joint_ids) - set(urdf_joint_names)
+            in_urdf_not_config = set(urdf_joint_names) - set(urdf_joint_ids)
+            raise AssertionError(
+                f"Joint name mismatch between config and URDF.\n"
+                f"  In config but not URDF: {sorted(in_config_not_urdf)}\n"
+                f"  In URDF but not config: {sorted(in_urdf_not_config)}\n"
+                f"  URDF path: {urdf_path}"
+            )
         all_reorder_indices = [urdf_joint_names.index(name) for name in urdf_joint_ids]
         finger_reorder_indices = [
             idx for i, idx in enumerate(all_reorder_indices) if i != wrist_idx

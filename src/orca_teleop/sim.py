@@ -13,7 +13,9 @@ from typing import Any
 
 import numpy as np
 from orca_core import OrcaJointPositions
-from orca_sim.envs import RENDER_FPS, BaseOrcaHandEnv
+from orca_sim.envs import BaseOrcaHandEnv
+
+RENDER_FPS = 30
 
 from orca_teleop.pipeline import _SHUTDOWN, RecordableSink
 from orca_teleop.utils import RateTicker
@@ -39,7 +41,7 @@ class OrcaHandSimSink(RecordableSink):
     def __init__(
         self,
         env_name: str = "right",
-        version: str | None = None,
+        version: str | None = "v2",
         render_mode: str = "human",
         camera_config: SimCameraConfig | None = None,
     ) -> None:
