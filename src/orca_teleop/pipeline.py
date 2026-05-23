@@ -529,6 +529,12 @@ def run_manus_local(
     """Run ``run()`` plus a local Manus ZMQ→gRPC publisher for one-command teleop."""
     import multiprocessing
 
+    print(
+        "\033[93mPrerequisite: run 'manus-client run' in a separate terminal before "
+        "starting the Manus teleop pipeline. The Manus SDK client must be streaming "
+        "glove data over ZMQ for this pipeline to receive frames.\033[0m"
+    )
+
     publisher_process = multiprocessing.Process(
         target=_manus_publisher,
         args=(port, handedness, zmq_address),
