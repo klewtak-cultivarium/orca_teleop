@@ -121,7 +121,7 @@ def main() -> int:
     palm_rot = data.xmat[palm_body_id].reshape(3, 3).copy()
     print(f"Palm body world position: {palm_pos}")
     print("Palm rotation rows (world axes of palm-local x,y,z):")
-    for axis_name, row in zip("xyz", palm_rot.T):
+    for axis_name, row in zip("xyz", palm_rot.T, strict=False):
         print(f"  palm-{axis_name} (world) = {row}")
     print()
 
@@ -138,9 +138,7 @@ def main() -> int:
 
     if not args.no_grasp:
         for actuator_name, ctrl_value in GRASP_CTRL.items():
-            actuator_id = mujoco.mj_name2id(
-                model, mujoco.mjtObj.mjOBJ_ACTUATOR, actuator_name
-            )
+            actuator_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_ACTUATOR, actuator_name)
             if actuator_id < 0:
                 print(f"Actuator '{actuator_name}' not found.", file=sys.stderr)
                 return 1
@@ -156,9 +154,7 @@ def main() -> int:
     print(f"Timestep:                 {timestep_ms:.2f} ms")
     print(f"Running:                  {args.steps} steps ({args.steps*timestep_ms/1000:.2f} s)")
     print()
-    print(
-        f"{'t_ms':>7} {'ncon':>5} {'cube_con':>9} {'force_N':>9} {'drift_mm':>9}"
-    )
+    print(f"{'t_ms':>7} {'ncon':>5} {'cube_con':>9} {'force_N':>9} {'drift_mm':>9}")
 
     force_scratch = np.zeros(6, dtype=np.float64)
 

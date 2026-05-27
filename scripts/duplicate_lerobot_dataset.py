@@ -98,17 +98,15 @@ def main() -> None:
         list(src.features),
     )
 
-    dest_root = args.dest_root if args.dest_root is not None else default_lerobot_root(
-        args.dest_repo_id
+    dest_root = (
+        args.dest_root if args.dest_root is not None else default_lerobot_root(args.dest_repo_id)
     )
     if args.overwrite and dest_root.exists():
         logger.info("--overwrite: removing existing dataset at %s", dest_root)
         shutil.rmtree(dest_root)
 
     image_feature_keys = {
-        name
-        for name, info in src.features.items()
-        if info.get("dtype") in ("image", "video")
+        name for name, info in src.features.items() if info.get("dtype") in ("image", "video")
     }
     user_feature_keys = [k for k in src.features if k not in _INTERNAL_FRAME_KEYS]
 
@@ -126,9 +124,7 @@ def main() -> None:
         features=src.features,
         root=dest_root,
         robot_type=getattr(src.meta, "robot_type", None),
-        use_videos=any(
-            info.get("dtype") == "video" for info in src.features.values()
-        ),
+        use_videos=any(info.get("dtype") == "video" for info in src.features.values()),
     )
 
     n_src_episodes = src.num_episodes

@@ -56,9 +56,7 @@ def _read_policy_type(policy_path: str) -> str:
     else:
         from huggingface_hub import hf_hub_download
 
-        config_path = Path(
-            hf_hub_download(repo_id=policy_path, filename="config.json")
-        )
+        config_path = Path(hf_hub_download(repo_id=policy_path, filename="config.json"))
     with open(config_path) as f:
         cfg = json.load(f)
     policy_type = cfg.get("type")
@@ -106,9 +104,7 @@ def _build_observation(
         renderer.update_scene(arm.data, camera=camera_name)
         img = renderer.render()
         img_chw = np.transpose(img, (2, 0, 1)).astype(np.float32) / 255.0
-        obs[feature_key] = (
-            torch.from_numpy(img_chw).unsqueeze(0).contiguous().to(device)
-        )
+        obs[feature_key] = torch.from_numpy(img_chw).unsqueeze(0).contiguous().to(device)
     return obs
 
 
@@ -266,14 +262,10 @@ def main() -> None:
         needs_state,
     )
 
-    expected_action_dim = (
-        len(arm.actuator_ids) + len(arm.hand_actuator_id_by_v2_joint)
-    )
+    expected_action_dim = len(arm.actuator_ids) + len(arm.hand_actuator_id_by_v2_joint)
     output_features = getattr(policy.config, "output_features", None) or {}
     action_feature = output_features.get("action")
-    if action_feature is not None and tuple(action_feature.shape) != (
-        expected_action_dim,
-    ):
+    if action_feature is not None and tuple(action_feature.shape) != (expected_action_dim,):
         logger.warning(
             "Policy action dim %s differs from arm action dim (%d); "
             "apply_action will fail if these don't match.",
@@ -281,9 +273,7 @@ def main() -> None:
             expected_action_dim,
         )
 
-    renderer = mujoco.Renderer(
-        arm.model, height=args.image_height, width=args.image_width
-    )
+    renderer = mujoco.Renderer(arm.model, height=args.image_height, width=args.image_width)
 
     video_writer = None
     video_renderer = None
@@ -294,9 +284,7 @@ def main() -> None:
 
         video_camera = args.video_camera or args.viewer_camera
         if not video_camera:
-            raise SystemExit(
-                "--video-out requires --video-camera or --viewer-camera to be set."
-            )
+            raise SystemExit("--video-out requires --video-camera or --viewer-camera to be set.")
         arm.camera_id(video_camera)
         video_renderer = mujoco.Renderer(
             arm.model, height=args.video_height, width=args.video_width

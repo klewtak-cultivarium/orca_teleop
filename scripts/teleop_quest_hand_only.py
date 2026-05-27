@@ -46,9 +46,7 @@ def _percentile(values: list[float], pct: float) -> float:
 
 class _Profiler:
     def __init__(self, window: int) -> None:
-        self.stages: dict[str, deque[float]] = {
-            name: deque(maxlen=window) for name in _STAGE_NAMES
-        }
+        self.stages: dict[str, deque[float]] = {name: deque(maxlen=window) for name in _STAGE_NAMES}
         self.pose_age_ms: deque[float] = deque(maxlen=window)
         self.ingress_ms: deque[float] = deque(maxlen=window)
         self.end_to_end_ms: deque[float] = deque(maxlen=window)
@@ -94,8 +92,7 @@ class _Profiler:
         if self.pose_age_ms:
             samples = list(self.pose_age_ms)
             parts.append(
-                "pose_age_ms(mean/p95)="
-                f"{mean(samples):5.1f}/{_percentile(samples, 95):5.1f}"
+                "pose_age_ms(mean/p95)=" f"{mean(samples):5.1f}/{_percentile(samples, 95):5.1f}"
             )
         if self.ingress_ms:
             samples = list(self.ingress_ms)
@@ -241,8 +238,7 @@ def main() -> None:
     logger.info("Quest bridge listening at %s", bridge.url)
     if bridge.ssl_context is None:
         logger.info(
-            "Quest Browser requires a secure context. Use an HTTPS tunnel, e.g.: "
-            "ngrok http %d",
+            "Quest Browser requires a secure context. Use an HTTPS tunnel, e.g.: " "ngrok http %d",
             args.port,
         )
 
@@ -289,9 +285,7 @@ def main() -> None:
                     )
                 try:
                     t0 = time.perf_counter_ns()
-                    joint_positions = retargeter_landmarks_from_webxr(
-                        landmarks, args.side
-                    )
+                    joint_positions = retargeter_landmarks_from_webxr(landmarks, args.side)
                     target = TargetPose(
                         joint_positions=joint_positions,
                         source="mediapipe",
@@ -308,9 +302,7 @@ def main() -> None:
                 if action is None:
                     if not calibrating_logged:
                         calibrating_logged = True
-                        logger.info(
-                            "Calibrating retargeter scale (first frames return no action)."
-                        )
+                        logger.info("Calibrating retargeter scale (first frames return no action).")
                 else:
                     if not streaming_logged:
                         streaming_logged = True

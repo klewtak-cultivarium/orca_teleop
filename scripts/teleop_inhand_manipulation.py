@@ -36,6 +36,7 @@ from pathlib import Path
 try:  # POSIX-only; Windows users will get keyboard controls disabled.
     import termios
     import tty
+
     _HAS_TERMIOS = True
 except ImportError:
     _HAS_TERMIOS = False
@@ -186,66 +187,129 @@ def _default_orcahand_model_path(side: str) -> str | None:
         return None
     path = (
         Path(orca_core.__file__).resolve().parent
-        / "models" / "v2" / f"orcahand_{side}" / "config.yaml"
+        / "models"
+        / "v2"
+        / f"orcahand_{side}"
+        / "config.yaml"
     )
     return str(path) if path.exists() else None
 
 
 def _default_orcahand_urdf_path(side: str) -> str | None:
     path = (
-        Path.home() / "Documents" / "orcahand_description"
-        / "v2" / "models" / "urdf" / f"orcahand_{side}.urdf"
+        Path.home()
+        / "Documents"
+        / "orcahand_description"
+        / "v2"
+        / "models"
+        / "urdf"
+        / f"orcahand_{side}.urdf"
     )
     return str(path) if path.exists() else None
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--output", required=True, type=Path,
-                        help="Local dataset root directory to write the LeRobotDataset into.")
-    parser.add_argument("--task", required=True,
-                        help="Task description recorded with every frame.")
-    parser.add_argument("--repo-id", default=None,
-                        help="LeRobotDataset repo-id (org/name). Defaults to local/<output dirname>.")
-    parser.add_argument("--num-episodes", type=int, default=1,
-                        help="Number of episodes to record (default: 1).")
-    parser.add_argument("--episode-seconds", type=float, default=None,
-                        help="Length of each episode in seconds; default: open-ended (Ctrl+C to end).")
-    parser.add_argument("--rest-seconds", type=float, default=2.0,
-                        help="Pause between episodes (default: 2.0).")
-    parser.add_argument("--fps", type=int, default=30,
-                        help="Dataset fps metadata + outer-loop target frequency (default: 30).")
-    parser.add_argument("--push-to-hub", action="store_true",
-                        help="After recording, push the dataset to the Hugging Face Hub.")
-    parser.add_argument("--overwrite", action="store_true",
-                        help="Wipe any existing dataset at --output before creating.")
-    parser.add_argument("--side", choices=("right",), default="right",
-                        help="OrcaHand side. Only right is supported by the cube-orientation env.")
-    parser.add_argument("--no-wrist", action="store_true",
-                        help="Disable landmark-derived wrist control (wrist stays at neutral).")
-    parser.add_argument("--wrist-scale", type=float, default=1.0,
-                        help="Scale factor on the computed wrist angle (1.0 = 1:1 mapping).")
+    parser.add_argument(
+        "--output",
+        required=True,
+        type=Path,
+        help="Local dataset root directory to write the LeRobotDataset into.",
+    )
+    parser.add_argument("--task", required=True, help="Task description recorded with every frame.")
+    parser.add_argument(
+        "--repo-id",
+        default=None,
+        help="LeRobotDataset repo-id (org/name). Defaults to local/<output dirname>.",
+    )
+    parser.add_argument(
+        "--num-episodes", type=int, default=1, help="Number of episodes to record (default: 1)."
+    )
+    parser.add_argument(
+        "--episode-seconds",
+        type=float,
+        default=None,
+        help="Length of each episode in seconds; default: open-ended (Ctrl+C to end).",
+    )
+    parser.add_argument(
+        "--rest-seconds", type=float, default=2.0, help="Pause between episodes (default: 2.0)."
+    )
+    parser.add_argument(
+        "--fps",
+        type=int,
+        default=30,
+        help="Dataset fps metadata + outer-loop target frequency (default: 30).",
+    )
+    parser.add_argument(
+        "--push-to-hub",
+        action="store_true",
+        help="After recording, push the dataset to the Hugging Face Hub.",
+    )
+    parser.add_argument(
+        "--overwrite",
+        action="store_true",
+        help="Wipe any existing dataset at --output before creating.",
+    )
+    parser.add_argument(
+        "--side",
+        choices=("right",),
+        default="right",
+        help="OrcaHand side. Only right is supported by the cube-orientation env.",
+    )
+    parser.add_argument(
+        "--no-wrist",
+        action="store_true",
+        help="Disable landmark-derived wrist control (wrist stays at neutral).",
+    )
+    parser.add_argument(
+        "--wrist-scale",
+        type=float,
+        default=1.0,
+        help="Scale factor on the computed wrist angle (1.0 = 1:1 mapping).",
+    )
     parser.add_argument("--host", default="0.0.0.0", help="Quest bridge bind host.")
     parser.add_argument("--port", type=int, default=8765, help="Quest bridge HTTP port.")
     parser.add_argument("--ssl-cert", default=None, help="Optional HTTPS certificate for WebXR.")
     parser.add_argument("--ssl-key", default=None, help="Optional HTTPS key for WebXR.")
-    parser.add_argument("--render-mode", default="human", choices=("human", "rgb_array", "none"),
-                        help="MuJoCo render mode. 'none' is fully headless.")
-    parser.add_argument("--camera", action="append", default=None,
-                        help="Camera name(s) to record into the dataset (repeatable). "
-                             "Default: wrist_camera and topdown. Pass an empty --camera '' to disable.")
-    parser.add_argument("--image-width", type=int, default=320,
-                        help="Width of recorded camera frames (default: 320).")
-    parser.add_argument("--image-height", type=int, default=240,
-                        help="Height of recorded camera frames (default: 240).")
-    parser.add_argument("--hand-model-path", default=None,
-                        help="OrcaHand model/config path for the retargeter.")
-    parser.add_argument("--hand-urdf-path", default=None,
-                        help="OrcaHand URDF path for the retargeter.")
-    parser.add_argument("--no-keyboard", action="store_true",
-                        help="Disable terminal keyboard controls (space=pause, e=reset, q=quit).")
-    parser.add_argument("--log-level", default="INFO",
-                        choices=("DEBUG", "INFO", "WARNING", "ERROR"))
+    parser.add_argument(
+        "--render-mode",
+        default="human",
+        choices=("human", "rgb_array", "none"),
+        help="MuJoCo render mode. 'none' is fully headless.",
+    )
+    parser.add_argument(
+        "--camera",
+        action="append",
+        default=None,
+        help="Camera name(s) to record into the dataset (repeatable). "
+        "Default: wrist_camera and topdown. Pass an empty --camera '' to disable.",
+    )
+    parser.add_argument(
+        "--image-width",
+        type=int,
+        default=320,
+        help="Width of recorded camera frames (default: 320).",
+    )
+    parser.add_argument(
+        "--image-height",
+        type=int,
+        default=240,
+        help="Height of recorded camera frames (default: 240).",
+    )
+    parser.add_argument(
+        "--hand-model-path", default=None, help="OrcaHand model/config path for the retargeter."
+    )
+    parser.add_argument(
+        "--hand-urdf-path", default=None, help="OrcaHand URDF path for the retargeter."
+    )
+    parser.add_argument(
+        "--no-keyboard",
+        action="store_true",
+        help="Disable terminal keyboard controls (space=pause, e=reset, q=quit).",
+    )
+    parser.add_argument(
+        "--log-level", default="INFO", choices=("DEBUG", "INFO", "WARNING", "ERROR")
+    )
     return parser.parse_args()
 
 
@@ -277,7 +341,9 @@ def main() -> None:
     last_action_rad = neutral_rad.copy()
     logger.info(
         "Env ready: scene=%s, %d actuators, cube body=%s",
-        Path(env.scene_path).name, n_act, env.cube_body_name,
+        Path(env.scene_path).name,
+        n_act,
+        env.cube_body_name,
     )
 
     # --- Cameras (in-scene named cameras rendered into the dataset) ---------
@@ -287,8 +353,7 @@ def main() -> None:
     else:
         camera_names = [c for c in args.camera if c]  # filter empty -> disables
     available = {
-        mujoco.mj_id2name(env.model, mujoco.mjtObj.mjOBJ_CAMERA, i)
-        for i in range(env.model.ncam)
+        mujoco.mj_id2name(env.model, mujoco.mjtObj.mjOBJ_CAMERA, i) for i in range(env.model.ncam)
     }
     missing = [c for c in camera_names if c not in available]
     if missing:
@@ -296,9 +361,15 @@ def main() -> None:
             f"Cameras not found in the loaded scene: {missing}. "
             f"Available: {sorted(n for n in available if n)}"
         )
-    renderer = mujoco.Renderer(env.model, height=args.image_height, width=args.image_width) if camera_names else None
+    renderer = (
+        mujoco.Renderer(env.model, height=args.image_height, width=args.image_width)
+        if camera_names
+        else None
+    )
     if camera_names:
-        logger.info("Recording cameras: %s @ %dx%d", camera_names, args.image_width, args.image_height)
+        logger.info(
+            "Recording cameras: %s @ %dx%d", camera_names, args.image_width, args.image_height
+        )
 
     # --- LeRobotDataset ------------------------------------------------------
     root = args.output.expanduser().resolve()
@@ -341,8 +412,10 @@ def main() -> None:
 
     # Ctrl+C ends the current episode (first), and ends the whole run (second).
     interrupt = {"count": 0}
+
     def _on_sigint(*_):
         interrupt["count"] += 1
+
     signal.signal(signal.SIGINT, _on_sigint)
 
     period = 1.0 / max(args.fps, 1)
@@ -366,7 +439,8 @@ def main() -> None:
 
             episode_deadline = (
                 time.monotonic() + args.episode_seconds
-                if args.episode_seconds is not None else float("inf")
+                if args.episode_seconds is not None
+                else float("inf")
             )
             n_frames = 0
             next_tick = time.monotonic()
@@ -380,8 +454,9 @@ def main() -> None:
                 # 0) Drain keyboard input
                 keyboard.update()
                 if keyboard.consume_reset():
-                    logger.info("Episode %d terminated by user; finalizing %d frames.",
-                                ep_idx + 1, n_frames)
+                    logger.info(
+                        "Episode %d terminated by user; finalizing %d frames.", ep_idx + 1, n_frames
+                    )
                     break
                 if keyboard.quit_requested:
                     logger.info("Quit requested; finalizing %d frames.", n_frames)
@@ -428,7 +503,9 @@ def main() -> None:
                         if not streaming_logged:
                             streaming_logged = True
                             logger.info("Retargeter calibrated; streaming actions to sim.")
-                        last_action_rad = np.deg2rad(action.as_array(actuator_joint_names)).astype(np.float32)
+                        last_action_rad = np.deg2rad(action.as_array(actuator_joint_names)).astype(
+                            np.float32
+                        )
 
                 # 2) Step the sim
                 try:

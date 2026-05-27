@@ -209,9 +209,7 @@ class MujocoPandaArm:
         self._settle_steps = int(max(0, settle_steps))
 
         self._gravity_compensation = bool(gravity_compensation)
-        self._robot_dof_ids = (
-            self._compute_robot_dof_ids() if self._gravity_compensation else None
-        )
+        self._robot_dof_ids = self._compute_robot_dof_ids() if self._gravity_compensation else None
 
         self.reset(pose)
 
@@ -321,9 +319,7 @@ class MujocoPandaArm:
         action = np.asarray(action, dtype=np.float64).reshape(-1)
         expected = len(self.actuator_ids) + len(self.hand_actuator_id_by_v2_joint)
         if action.shape != (expected,):
-            raise ValueError(
-                f"apply_action expected shape ({expected},), got {action.shape}"
-            )
+            raise ValueError(f"apply_action expected shape ({expected},), got {action.shape}")
         panda_low = self.model.actuator_ctrlrange[self.actuator_ids, 0]
         panda_high = self.model.actuator_ctrlrange[self.actuator_ids, 1]
         self.data.ctrl[self.actuator_ids] = np.clip(
@@ -508,9 +504,7 @@ class MujocoPandaArm:
         self.mujoco.mj_forward(self.model, self.data)
         if not self._gravity_compensation or self._robot_dof_ids is None:
             return
-        self.data.qfrc_applied[self._robot_dof_ids] = (
-            self.data.qfrc_bias[self._robot_dof_ids]
-        )
+        self.data.qfrc_applied[self._robot_dof_ids] = self.data.qfrc_bias[self._robot_dof_ids]
 
 
 class RelativeControllerMapper:

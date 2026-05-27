@@ -30,10 +30,8 @@ from __future__ import annotations
 
 import argparse
 import logging
-import select
 import shutil
 import signal
-import ssl
 import sys
 import time
 from pathlib import Path
@@ -131,9 +129,7 @@ def _load_pretrained_policy(source: str, device: str):
     policy = ACTPolicy.from_pretrained(resolved)
     policy.to(device)
     policy.eval()
-    preprocessor, postprocessor = make_pre_post_processors(
-        policy.config, pretrained_path=resolved
-    )
+    preprocessor, postprocessor = make_pre_post_processors(policy.config, pretrained_path=resolved)
     return policy, preprocessor, postprocessor
 
 
@@ -146,38 +142,77 @@ def _hwc_uint8_to_chw_float(img: np.ndarray, device: str) -> torch.Tensor:
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__)
     src = p.add_mutually_exclusive_group()
-    src.add_argument("--from-scratch", action="store_true",
-                     help="Build a randomly-initialised ACT policy (default).")
-    src.add_argument("--policy-path", default=None,
-                     help="Local directory holding a trained ACT checkpoint (LeRobot format).")
-    src.add_argument("--policy-repo-id", default=None,
-                     help="HF Hub repo id of a trained ACT checkpoint, e.g. user/orca-inhand-act.")
-    p.add_argument("--chunk-size", type=int, default=100,
-                   help="Action chunk size for the (scratch) ACT config (default: 100).")
-    p.add_argument("--device", default=None,
-                   help="Torch device: 'cpu', 'cuda', 'mps'. Default: cuda > mps > cpu.")
-    p.add_argument("--output", type=Path, default=None,
-                   help="Optional LeRobotDataset root to record the rollout into.")
-    p.add_argument("--task", default="autonomous in-hand rollout",
-                   help="Task description recorded with every frame.")
-    p.add_argument("--repo-id", default=None,
-                   help="LeRobotDataset repo-id (org/name). Default: local/<output dirname>.")
+    src.add_argument(
+        "--from-scratch",
+        action="store_true",
+        help="Build a randomly-initialised ACT policy (default).",
+    )
+    src.add_argument(
+        "--policy-path",
+        default=None,
+        help="Local directory holding a trained ACT checkpoint (LeRobot format).",
+    )
+    src.add_argument(
+        "--policy-repo-id",
+        default=None,
+        help="HF Hub repo id of a trained ACT checkpoint, e.g. user/orca-inhand-act.",
+    )
+    p.add_argument(
+        "--chunk-size",
+        type=int,
+        default=100,
+        help="Action chunk size for the (scratch) ACT config (default: 100).",
+    )
+    p.add_argument(
+        "--device",
+        default=None,
+        help="Torch device: 'cpu', 'cuda', 'mps'. Default: cuda > mps > cpu.",
+    )
+    p.add_argument(
+        "--output",
+        type=Path,
+        default=None,
+        help="Optional LeRobotDataset root to record the rollout into.",
+    )
+    p.add_argument(
+        "--task",
+        default="autonomous in-hand rollout",
+        help="Task description recorded with every frame.",
+    )
+    p.add_argument(
+        "--repo-id",
+        default=None,
+        help="LeRobotDataset repo-id (org/name). Default: local/<output dirname>.",
+    )
     p.add_argument("--num-episodes", type=int, default=1)
-    p.add_argument("--episode-seconds", type=float, default=None,
-                   help="Length of each episode; default: open-ended (e/q to end).")
+    p.add_argument(
+        "--episode-seconds",
+        type=float,
+        default=None,
+        help="Length of each episode; default: open-ended (e/q to end).",
+    )
     p.add_argument("--rest-seconds", type=float, default=2.0)
     p.add_argument("--fps", type=int, default=30)
-    p.add_argument("--overwrite", action="store_true",
-                   help="Wipe any existing dataset at --output before creating.")
+    p.add_argument(
+        "--overwrite",
+        action="store_true",
+        help="Wipe any existing dataset at --output before creating.",
+    )
     p.add_argument("--render-mode", default="human", choices=("human", "rgb_array", "none"))
     p.add_argument("--image-width", type=int, default=320)
     p.add_argument("--image-height", type=int, default=240)
-    p.add_argument("--camera", action="append", default=None,
-                   help="Camera names to render (repeatable). Default: wrist_camera + topdown.")
-    p.add_argument("--no-keyboard", action="store_true",
-                   help="Disable terminal keyboard controls (SPACE / e / q).")
-    p.add_argument("--log-level", default="INFO",
-                   choices=("DEBUG", "INFO", "WARNING", "ERROR"))
+    p.add_argument(
+        "--camera",
+        action="append",
+        default=None,
+        help="Camera names to render (repeatable). Default: wrist_camera + topdown.",
+    )
+    p.add_argument(
+        "--no-keyboard",
+        action="store_true",
+        help="Disable terminal keyboard controls (SPACE / e / q).",
+    )
+    p.add_argument("--log-level", default="INFO", choices=("DEBUG", "INFO", "WARNING", "ERROR"))
     return p.parse_args()
 
 
@@ -213,7 +248,9 @@ def main() -> None:
     ).astype(np.float32)
     logger.info(
         "Env ready: scene=%s, %d actuators, cube body=%s",
-        Path(env.scene_path).name, n_act, env.cube_body_name,
+        Path(env.scene_path).name,
+        n_act,
+        env.cube_body_name,
     )
 
     # --- Cameras ------------------------------------------------------------
@@ -222,8 +259,7 @@ def main() -> None:
     else:
         camera_names = [c for c in args.camera if c]
     available = {
-        mujoco.mj_id2name(env.model, mujoco.mjtObj.mjOBJ_CAMERA, i)
-        for i in range(env.model.ncam)
+        mujoco.mj_id2name(env.model, mujoco.mjtObj.mjOBJ_CAMERA, i) for i in range(env.model.ncam)
     }
     missing = [c for c in camera_names if c not in available]
     if missing:
@@ -246,16 +282,22 @@ def main() -> None:
         policy, preprocessor, postprocessor = _load_pretrained_policy(args.policy_repo_id, device)
         policy_source = f"hub:{args.policy_repo_id}"
     else:
-        logger.info("Building scratch ACT policy (chunk_size=%d, vision=resnet18)",
-                    args.chunk_size)
+        logger.info("Building scratch ACT policy (chunk_size=%d, vision=resnet18)", args.chunk_size)
         policy = _build_scratch_policy(
-            n_act, args.image_height, args.image_width,
-            chunk_size=args.chunk_size, device=device,
+            n_act,
+            args.image_height,
+            args.image_width,
+            chunk_size=args.chunk_size,
+            device=device,
         )
         policy_source = "scratch"  # identity normalization; no processors needed
     n_params = sum(p.numel() for p in policy.parameters())
-    logger.info("Policy ready: source=%s, params=%.1fM, processors=%s",
-                policy_source, n_params / 1e6, preprocessor is not None)
+    logger.info(
+        "Policy ready: source=%s, params=%.1fM, processors=%s",
+        policy_source,
+        n_params / 1e6,
+        preprocessor is not None,
+    )
 
     # --- Optional dataset to record the rollout into ------------------------
     dataset = None
@@ -268,9 +310,17 @@ def main() -> None:
             logger.info("--overwrite: removing existing dataset at %s", root)
             shutil.rmtree(root)
         features = {
-            "observation.state": {"dtype": "float32", "shape": (n_act,), "names": actuator_joint_names},
+            "observation.state": {
+                "dtype": "float32",
+                "shape": (n_act,),
+                "names": actuator_joint_names,
+            },
             "observation.cube_pos": {"dtype": "float32", "shape": (3,), "names": ["x", "y", "z"]},
-            "observation.cube_quat": {"dtype": "float32", "shape": (4,), "names": ["w", "x", "y", "z"]},
+            "observation.cube_quat": {
+                "dtype": "float32",
+                "shape": (4,),
+                "names": ["w", "x", "y", "z"],
+            },
             "action": {"dtype": "float32", "shape": (n_act,), "names": actuator_joint_names},
         }
         for cam_name in camera_names:
@@ -290,8 +340,10 @@ def main() -> None:
 
     # --- Ctrl+C + keyboard --------------------------------------------------
     interrupt = {"count": 0}
+
     def _on_sigint(*_):
         interrupt["count"] += 1
+
     signal.signal(signal.SIGINT, _on_sigint)
 
     keyboard = KeyboardController()
@@ -304,15 +356,17 @@ def main() -> None:
         for ep_idx in range(args.num_episodes):
             if interrupt["count"] >= 2 or keyboard.quit_requested:
                 break
-            logger.info("=== Episode %d / %d (policy=%s) ===",
-                        ep_idx + 1, args.num_episodes, policy_source)
+            logger.info(
+                "=== Episode %d / %d (policy=%s) ===", ep_idx + 1, args.num_episodes, policy_source
+            )
             env.reset()
             policy.reset()  # clear ACT's action queue between episodes
             last_action_rad = neutral_rad.copy()
             interrupt_at_episode_start = interrupt["count"]
             episode_deadline = (
                 time.monotonic() + args.episode_seconds
-                if args.episode_seconds is not None else float("inf")
+                if args.episode_seconds is not None
+                else float("inf")
             )
             n_frames = 0
             next_tick = time.monotonic()
@@ -325,8 +379,9 @@ def main() -> None:
 
                 keyboard.update()
                 if keyboard.consume_reset():
-                    logger.info("Episode %d terminated by user; finalizing %d frames.",
-                                ep_idx + 1, n_frames)
+                    logger.info(
+                        "Episode %d terminated by user; finalizing %d frames.", ep_idx + 1, n_frames
+                    )
                     break
                 if keyboard.quit_requested:
                     logger.info("Quit requested; finalizing %d frames.", n_frames)
@@ -422,9 +477,17 @@ def main() -> None:
                     dataset.save_episode()
                 except Exception:
                     logger.exception("save_episode() failed.")
-            if ep_idx + 1 < args.num_episodes and interrupt["count"] < 2 and not keyboard.quit_requested:
+            if (
+                ep_idx + 1 < args.num_episodes
+                and interrupt["count"] < 2
+                and not keyboard.quit_requested
+            ):
                 rest_end = time.monotonic() + max(args.rest_seconds, 0.0)
-                while time.monotonic() < rest_end and interrupt["count"] < 2 and not keyboard.quit_requested:
+                while (
+                    time.monotonic() < rest_end
+                    and interrupt["count"] < 2
+                    and not keyboard.quit_requested
+                ):
                     time.sleep(0.05)
     finally:
         if dataset is not None:

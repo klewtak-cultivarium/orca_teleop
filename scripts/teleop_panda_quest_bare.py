@@ -403,9 +403,7 @@ def _run_with_viewer(
     target_qpos = arm.arm_qpos()
     period = (1.0 / float(fps)) if fps is not None and fps > 0 else None
     next_tick = time.monotonic()
-    with mujoco.viewer.launch_passive(
-        arm.model, arm.data, key_callback=key_callback
-    ) as viewer:
+    with mujoco.viewer.launch_passive(arm.model, arm.data, key_callback=key_callback) as viewer:
         if viewer_camera is None:
             viewer.cam.lookat[:] = [0.05, 0.0, 0.55]
             viewer.cam.distance = 2.35
@@ -680,9 +678,7 @@ def main() -> None:
                     source_matrix = bridge.state.get_controller_matrix(args.side)
                     hand_landmarks = None
                     buttons = bridge.state.get_controller_buttons(args.side)
-                    clutch_engaged = (
-                        _button_value(buttons, args.hold_button_index) > 0.5
-                    )
+                    clutch_engaged = _button_value(buttons, args.hold_button_index) > 0.5
                     if bridge.state.pop_event("recenter") and clutch_engaged:
                         if source_matrix is not None:
                             mapper.calibrate(source_matrix, arm.end_effector_matrix())
@@ -722,11 +718,7 @@ def main() -> None:
                             "Calibrated %s wrist to right-carpals frame on clutch engage.",
                             args.input_mode,
                         )
-                elif (
-                    clutch_engaged
-                    and not mapper.calibrated
-                    and source_matrix is not None
-                ):
+                elif clutch_engaged and not mapper.calibrated and source_matrix is not None:
                     mapper.calibrate(source_matrix, arm.end_effector_matrix())
                     logger.info(
                         "Calibrated %s wrist to right-carpals frame (delayed engage).",
@@ -738,17 +730,12 @@ def main() -> None:
                 recv_mono = bridge.state.last_update_monotonic
                 fresh_telemetry = recv_mono > last_retarget_recv_mono
 
-                if (
-                    live_retargeter is not None
-                    and args.input_mode == "hand"
-                    and fresh_telemetry
-                ):
+                if live_retargeter is not None and args.input_mode == "hand" and fresh_telemetry:
                     if hand_landmarks is None:
                         if not hand_landmarks_missing_logged:
                             hand_landmarks_missing_logged = True
                             logger.info(
-                                "Quest %s hand landmarks lost; "
-                                "holding last OrcaHand action.",
+                                "Quest %s hand landmarks lost; " "holding last OrcaHand action.",
                                 args.side,
                             )
                     else:
@@ -771,8 +758,7 @@ def main() -> None:
                             hand_action = live_retargeter.retarget(hand_target)
                         except Exception:
                             logger.exception(
-                                "Live hand retargeting failed; "
-                                "continuing with arm-only teleop."
+                                "Live hand retargeting failed; " "continuing with arm-only teleop."
                             )
                             live_retargeter = None
                             hand_action = None
@@ -787,19 +773,12 @@ def main() -> None:
                         else:
                             if not hand_ready_logged:
                                 hand_ready_logged = True
-                                logger.info(
-                                    "Retargeter calibrated; "
-                                    "OrcaHand controls ready."
-                                )
+                                logger.info("Retargeter calibrated; " "OrcaHand controls ready.")
                             last_hand_action = hand_action
 
                     last_retarget_recv_mono = recv_mono
 
-                if (
-                    clutch_engaged
-                    and mapper.calibrated
-                    and source_matrix is not None
-                ):
+                if clutch_engaged and mapper.calibrated and source_matrix is not None:
                     target_matrix = mapper.target_matrix(source_matrix)
                     target_qpos = arm.solve_ik(target_matrix, initial_qpos=target_qpos)
 
@@ -838,9 +817,7 @@ def main() -> None:
                 if scene is None:
                     if not overlay_logged_once:
                         overlay_logged_once = True
-                        logger.warning(
-                            "Debug overlay disabled: viewer.user_scn is None."
-                        )
+                        logger.warning("Debug overlay disabled: viewer.user_scn is None.")
                     return
                 with viewer.lock():
                     idx = 0
@@ -851,11 +828,7 @@ def main() -> None:
                         scale=big_scale,
                         width=big_width,
                     )
-                    if (
-                        mapper.calibrated
-                        and last_source_matrix is not None
-                        and prev_clutch_engaged
-                    ):
+                    if mapper.calibrated and last_source_matrix is not None and prev_clutch_engaged:
                         target_matrix = mapper.target_matrix(last_source_matrix)
                         idx = _add_frame_geoms(
                             scene,
