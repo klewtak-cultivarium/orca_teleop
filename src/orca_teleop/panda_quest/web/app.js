@@ -13,7 +13,7 @@ let lastTelemetrySentAtMs = -Infinity;
 let lastSocketReadyState = null;
 let telemetryPacketCount = 0;
 
-const TARGET_TELEMETRY_HZ = 30;
+const TARGET_TELEMETRY_HZ = 60;
 const MAX_TELEMETRY_BUFFERED_AMOUNT = 128 * 1024;
 const RECONNECT_DELAY_MS = 750;
 const WEBXR_HAND_JOINTS = [
@@ -179,6 +179,7 @@ function sendTelemetry(frame, pose, referenceSpace, nowMs) {
   const payload = {
     type: "telemetry",
     timestamp_ms: nowMs,
+    client_wall_ms: Date.now(),
     head: matrixToArray(pose.transform.matrix),
     controllers: {},
     hands: {},

@@ -15,9 +15,34 @@ from collections.abc import Sequence
 
 import numpy as np
 
+from orca_teleop.panda_quest.dataset_replay import (
+    RETARGETER_HAND_LANDMARK_NAMES,
+    WEBXR_HAND_JOINT_NAMES,
+    retargeter_landmarks_from_webxr,
+)
 from orca_teleop.panda_quest.quest_bridge import HAND_SIDES, QuestTelemetryBridge
 
 logger = logging.getLogger("quest_telemetry_probe")
+
+# Per the WebXR Hand Input spec, `*-finger-metacarpal` sits at the wrist-side
+# end of the metacarpal bone (carpometacarpal joint), and `*-phalanx-proximal`
+# sits at the MCP knuckle. The retargeter consumes the "MCP" landmark as the
+# finger base, so we need to know which WebXR joint Quest actually reports
+# there: anatomically realistic MCP-knuckle distances from the wrist on an
+# adult hand are ~5–9 cm; carpometacarpal distances are ~1–3 cm.
+_FINGER_METACARPAL_INDICES = {
+    "index": WEBXR_HAND_JOINT_NAMES.index("index-finger-metacarpal"),
+    "middle": WEBXR_HAND_JOINT_NAMES.index("middle-finger-metacarpal"),
+    "ring": WEBXR_HAND_JOINT_NAMES.index("ring-finger-metacarpal"),
+    "pinky": WEBXR_HAND_JOINT_NAMES.index("pinky-finger-metacarpal"),
+}
+_FINGER_PHALANX_PROXIMAL_INDICES = {
+    "index": WEBXR_HAND_JOINT_NAMES.index("index-finger-phalanx-proximal"),
+    "middle": WEBXR_HAND_JOINT_NAMES.index("middle-finger-phalanx-proximal"),
+    "ring": WEBXR_HAND_JOINT_NAMES.index("ring-finger-phalanx-proximal"),
+    "pinky": WEBXR_HAND_JOINT_NAMES.index("pinky-finger-phalanx-proximal"),
+}
+_KNUCKLE_DISTANCE_THRESHOLD_M = 0.045
 
 
 def _ssl_context(certfile: str | None, keyfile: str | None) -> ssl.SSLContext | None:
@@ -60,6 +85,16 @@ def parse_args() -> argparse.Namespace:
         help="Decimal precision for printed numeric arrays.",
     )
     parser.add_argument(
+        "--anatomy-check",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Print per-frame wrist→metacarpal and wrist→phalanx-proximal "
+            "distances per finger, with a verdict about which WebXR joint "
+            "Quest is reporting at the MCP knuckle."
+        ),
+    )
+    parser.add_argument(
         "--log-level",
         default="INFO",
         choices=("DEBUG", "INFO", "WARNING", "ERROR"),
@@ -97,7 +132,108 @@ def _landmark_summary(landmarks: np.ndarray | None, precision: int) -> str:
     return f"shape={landmarks.shape} {samples}"
 
 
-def _print_summary(bridge: QuestTelemetryBridge, *, precision: int, sequence: int) -> None:
+def _retargeter_landmark_summary(
+    landmarks: np.ndarray | None,
+    side: str,
+    precision: int,
+) -> str:
+    if landmarks is None:
+        return "missing"
+    try:
+        retargeter_landmarks = retargeter_landmarks_from_webxr(landmarks, side)
+    except ValueError as exc:
+        return f"unavailable ({exc})"
+
+    sample_names = (
+        "wrist",
+        "thumb_tip",
+        "index_tip",
+        "middle_tip",
+        "ring_tip",
+        "pinky_tip",
+    )
+    samples = " ".join(
+        f"{name}={_fmt_array(retargeter_landmarks[RETARGETER_HAND_LANDMARK_NAMES.index(name)], precision)}"
+        for name in sample_names
+    )
+    return f"shape={retargeter_landmarks.shape} {samples}"
+
+
+def _anatomy_check_lines(
+    landmarks: np.ndarray | None,
+    precision: int,
+) -> list[str]:
+    """Probe whether Quest reports `*-finger-metacarpal` near the wrist (spec)
+    or at the MCP knuckle (what the retargeter currently assumes)."""
+    if landmarks is None or landmarks.shape != (25, 3):
+        return ["    (no 25-joint hand landmarks)"]
+
+    wrist = landmarks[0]
+    metacarpal_dists: list[float] = []
+    phalanx_dists: list[float] = []
+    rows: list[str] = []
+    for finger in ("index", "middle", "ring", "pinky"):
+        m_idx = _FINGER_METACARPAL_INDICES[finger]
+        p_idx = _FINGER_PHALANX_PROXIMAL_INDICES[finger]
+        d_m = float(np.linalg.norm(landmarks[m_idx] - wrist))
+        d_p = float(np.linalg.norm(landmarks[p_idx] - wrist))
+        metacarpal_dists.append(d_m)
+        phalanx_dists.append(d_p)
+        rows.append(
+            f"    {finger:<6} wrist→metacarpal={d_m:.{precision}f}m  "
+            f"wrist→phalanx_proximal={d_p:.{precision}f}m  "
+            f"Δ={d_p - d_m:+.{precision}f}m"
+        )
+
+    median_metacarpal = float(np.median(metacarpal_dists))
+    median_phalanx = float(np.median(phalanx_dists))
+
+    if median_metacarpal >= _KNUCKLE_DISTANCE_THRESHOLD_M:
+        verdict = (
+            f"verdict: metacarpal is at the MCP knuckle "
+            f"(median wrist→metacarpal={median_metacarpal:.3f}m ≥ "
+            f"{_KNUCKLE_DISTANCE_THRESHOLD_M:.3f}m). "
+            "Current WEBXR_TO_RETARGETER_LANDMARK_INDICES is anatomically OK."
+        )
+    else:
+        verdict = (
+            f"verdict: metacarpal is near the wrist "
+            f"(median wrist→metacarpal={median_metacarpal:.3f}m < "
+            f"{_KNUCKLE_DISTANCE_THRESHOLD_M:.3f}m); "
+            f"phalanx-proximal is at the knuckle "
+            f"(median={median_phalanx:.3f}m). "
+            "Swap the index/middle/ring/pinky base indices in "
+            "WEBXR_TO_RETARGETER_LANDMARK_INDICES from {5,10,15,20} to {6,11,16,21}."
+        )
+
+    palm_width_metacarpal = float(
+        np.linalg.norm(
+            landmarks[_FINGER_METACARPAL_INDICES["index"]]
+            - landmarks[_FINGER_METACARPAL_INDICES["pinky"]]
+        )
+    )
+    palm_width_phalanx = float(
+        np.linalg.norm(
+            landmarks[_FINGER_PHALANX_PROXIMAL_INDICES["index"]]
+            - landmarks[_FINGER_PHALANX_PROXIMAL_INDICES["pinky"]]
+        )
+    )
+
+    rows.append(
+        f"    palm width (index↔pinky): metacarpal={palm_width_metacarpal:.{precision}f}m  "
+        f"phalanx_proximal={palm_width_phalanx:.{precision}f}m"
+    )
+    rows.append(f"    {verdict}")
+    return rows
+
+
+def _print_summary(
+    bridge: QuestTelemetryBridge,
+    *,
+    precision: int,
+    sequence: int,
+    anatomy_check: bool,
+) -> None:
     now = time.monotonic()
     telemetry_age = now - bridge.state.last_update_monotonic
     print(f"\n[{sequence:05d}] telemetry_age={telemetry_age:.3f}s", flush=True)
@@ -120,6 +256,15 @@ def _print_summary(bridge: QuestTelemetryBridge, *, precision: int, sequence: in
             f"  {side} hand landmarks: {_landmark_summary(hand_landmarks, precision)}",
             flush=True,
         )
+        print(
+            f"  {side} retargeter landmarks: "
+            f"{_retargeter_landmark_summary(hand_landmarks, side, precision)}",
+            flush=True,
+        )
+        if anatomy_check:
+            print(f"  {side} anatomy check:", flush=True)
+            for line in _anatomy_check_lines(hand_landmarks, precision):
+                print(line, flush=True)
 
 
 def main() -> None:
@@ -153,7 +298,12 @@ def main() -> None:
         logger.info("Quest telemetry connected; printing summaries every %.2fs.", args.interval)
         while True:
             sequence += 1
-            _print_summary(bridge, precision=args.precision, sequence=sequence)
+            _print_summary(
+                bridge,
+                precision=args.precision,
+                sequence=sequence,
+                anatomy_check=args.anatomy_check,
+            )
             if args.raw and sequence % max(1, args.raw_every) == 0:
                 payload = bridge.get_last_telemetry_payload()
                 print("  raw telemetry:", flush=True)

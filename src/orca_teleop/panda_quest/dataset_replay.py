@@ -66,27 +66,39 @@ RETARGETER_HAND_LANDMARK_NAMES = (
     "pinky_dip",
     "pinky_tip",
 )
+# WebXR exposes 25 joints per hand; the retargeter wants the 21-joint
+# MediaPipe/MANO layout. For the thumb, WebXR's four post-wrist joints
+# (thumb-metacarpal=CMC, phalanx-proximal=MCP, phalanx-distal=IP, tip) line
+# up one-for-one with MediaPipe's (thumb_cmc, thumb_mcp, thumb_ip, thumb_tip).
+# For the other four fingers, WebXR ships an extra `*-finger-metacarpal`
+# joint that the WebXR Hand Input spec places at the *wrist-side end* of the
+# metacarpal bone — i.e. at the carpometacarpal junction, not at the MCP
+# knuckle (verified on Quest with `scripts/quest_telemetry_probe.py`:
+# wrist→metacarpal ≈ 4 cm, wrist→phalanx_proximal ≈ 9 cm). MediaPipe's
+# `{finger}_mcp` is the MCP knuckle, which is WebXR's `phalanx-proximal`, so
+# we *drop the metacarpal* (not the phalanx-distal!) and keep
+# (phalanx-proximal, phalanx-intermediate, phalanx-distal, tip).
 WEBXR_TO_RETARGETER_LANDMARK_INDICES = (
     0,  # wrist
     1,
     2,
     3,
-    4,  # thumb: WebXR already has four post-wrist joints
-    5,
+    4,  # thumb: WebXR thumb-metacarpal=CMC, phalanx-proximal=MCP, phalanx-distal=IP, tip
     6,
     7,
-    9,  # index: drop WebXR phalanx-distal, keep tip
-    10,
+    8,
+    9,  # index: drop WebXR metacarpal; phalanx-proximal=MCP, intermediate=PIP, distal=DIP, tip
     11,
     12,
+    13,
     14,  # middle
-    15,
     16,
     17,
+    18,
     19,  # ring
-    20,
     21,
     22,
+    23,
     24,  # pinky
 )
 
@@ -204,8 +216,21 @@ def retargeter_landmarks_from_webxr(points: np.ndarray, side: str) -> np.ndarray
     WebXR exposes 25 joints: wrist plus four thumb joints and five joints for
     each non-thumb finger, ordered by ``WEBXR_HAND_JOINT_NAMES``. The retargeter
     expects the 21-point MediaPipe/MANO-like layout in
-    ``RETARGETER_HAND_LANDMARK_NAMES`` order, so this drops WebXR's extra distal
-    phalanx joint for each non-thumb finger while preserving each fingertip.
+    ``RETARGETER_HAND_LANDMARK_NAMES`` order. For each non-thumb finger we
+    drop the WebXR ``*-finger-metacarpal`` joint (which the spec places at the
+    *wrist-side* end of the metacarpal bone, not at the MCP knuckle) and keep
+    phalanx-proximal/intermediate/distal/tip — those map one-for-one to
+    MediaPipe's mcp/pip/dip/tip. The thumb already has only four post-wrist
+    joints, which line up with MediaPipe's cmc/mcp/ip/tip directly.
+
+    WebXR already reports hand joints in a right-handed reference space, so no
+    chirality flip is needed here — the retargeter's canonical hand frame
+    (``z = cross(x, y)``, "out of the palm for a right hand") matches the
+    incoming right-hand geometry directly. Mirroring an axis would flip the
+    right hand into a left-hand shape and break IK against the right OrcaHand
+    URDF. The recorded HF replays go through ``retargeter_landmarks_from_quest``
+    instead, which still mirrors because that data is stored in Unity's
+    left-handed frame.
     """
     if side not in ("left", "right"):
         raise ValueError(f"Unsupported side: {side!r}")
@@ -213,10 +238,7 @@ def retargeter_landmarks_from_webxr(points: np.ndarray, side: str) -> np.ndarray
     if landmarks_25.ndim != 2 or landmarks_25.shape != (25, 3):
         raise ValueError(f"Expected WebXR landmarks with shape (25, 3), got {landmarks_25.shape}.")
 
-    landmarks = landmarks_25[list(WEBXR_TO_RETARGETER_LANDMARK_INDICES)].copy()
-    if side == "right":
-        landmarks[:, 1] *= -1.0
-    return landmarks
+    return landmarks_25[list(WEBXR_TO_RETARGETER_LANDMARK_INDICES)].copy()
 
 
 def iter_wrist_pose_samples(

@@ -1,9 +1,11 @@
-"""Barebones Meta Quest teleop for OrcaPanda MuJoCo scenes.
+"""Bare-scene Meta Quest teleop for behaviour-cloning data collection.
 
-By default it loads the OrcaPanda cube-stacking scene, opens a MuJoCo viewer on
-the host, and uses the right Quest controller as a relative end-effector target.
-HF replay can additionally retarget recorded Quest hand landmarks into the
-right OrcaHand actuators in the scene.
+Loads the OrcaPanda robot in an empty MuJoCo world (no table, no cubes, just
+a floor and a single ``frontal`` camera). The right Quest controller drives a
+relative end-effector target; optional Quest hand-tracking retargets onto the
+right OrcaHand. Pair with ``--record-lerobot`` to dump (frontal RGB +
+proprio + action) episodes into a LeRobotDataset that can be used to train a
+BC policy and deploy it back into this same scene.
 """
 
 from __future__ import annotations
@@ -25,16 +27,17 @@ from orca_teleop.panda_quest.dataset_replay import (
     retargeter_landmarks_from_webxr,
 )
 from orca_teleop.panda_quest.mujoco_panda import (
-    DEFAULT_CUBE_STACKING_KEYFRAME,
+    DEFAULT_BARE_KEYFRAME,
     MujocoPandaArm,
     RelativeControllerMapper,
 )
 from orca_teleop.panda_quest.quest_bridge import QuestTelemetryBridge
 
-logger = logging.getLogger("teleop_panda_quest")
+logger = logging.getLogger("teleop_panda_quest_bare")
 
 # orca_sim hand env advances 5 mj_steps per control frame at 30 Hz.
 _ORCA_SIM_HAND_FRAME_SKIP = 5
+_DEFAULT_FRONTAL_CAMERA = "frontal"
 
 
 @dataclass(frozen=True)
@@ -74,12 +77,6 @@ def _add_frame_geoms(
     width: float = 0.005,
     alpha: float = 1.0,
 ) -> int:
-    """Populate ``scene.geoms[start_idx:start_idx+3]`` with an RGB triad.
-
-    Returns the next free index. Does NOT update ``scene.ngeom`` — the caller is
-    expected to set it to the final length once after adding all geoms (per the
-    official MuJoCo passive-viewer pattern).
-    """
     import mujoco
 
     if matrix is None:
@@ -133,20 +130,9 @@ def _button_value(buttons: list[float], index: int) -> float:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
-        "--scene",
-        choices=("cube-stacking", "legacy"),
-        default="cube-stacking",
-        help="MuJoCo scene to load. Defaults to OrcaPanda cube stacking.",
-    )
-    parser.add_argument(
         "--scene-path",
         default=None,
-        help="Path to an OrcaPanda cube-stacking MJCF scene.",
-    )
-    parser.add_argument(
-        "--model-path",
-        default=None,
-        help="Path to legacy orcapanda.xml. Kept for old direct-model probes.",
+        help="Optional override for the bare-scene MJCF (defaults to the vendored snapshot).",
     )
     parser.add_argument("--host", default="0.0.0.0", help="Quest bridge bind host.")
     parser.add_argument("--port", type=int, default=8765, help="Quest bridge HTTP port.")
@@ -154,13 +140,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--ssl-key", default=None, help="Optional HTTPS key for WebXR.")
     parser.add_argument(
         "--pose",
-        default=None,
-        help="Reset pose/keyframe. Defaults to orcapanda_home for cube-stacking, ready for legacy.",
+        default=DEFAULT_BARE_KEYFRAME,
+        help=f"Reset keyframe. Defaults to {DEFAULT_BARE_KEYFRAME!r}.",
     )
     parser.add_argument(
         "--viewer-camera",
-        default=None,
-        help="Optional fixed MuJoCo camera name for the passive viewer, e.g. orcapanda_overview.",
+        default=_DEFAULT_FRONTAL_CAMERA,
+        help=(
+            f"Fixed MuJoCo camera name for the passive viewer. Defaults to "
+            f"{_DEFAULT_FRONTAL_CAMERA!r} so the operator sees what the policy "
+            "will see at inference time."
+        ),
     )
     parser.add_argument(
         "--headless",
@@ -193,8 +183,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--replay-hf-dataset",
         default=None,
-        help="Replay recorded Quest wrist poses from a Hugging Face dataset, e.g. "
-        "fracapuano/quest-calibration or fracapuano/quest-poses.",
+        help="Replay recorded Quest wrist poses from a Hugging Face dataset.",
     )
     parser.add_argument("--replay-filename", default="data.parquet")
     parser.add_argument("--replay-fps", type=float, default=30.0)
@@ -227,17 +216,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--debug-overlay",
         action=argparse.BooleanOptionalAction,
-        default=True,
-        help="Draw RGB triads for the carpals body, IK target, and source wrist in the viewer.",
+        default=False,
+        help=(
+            "Draw RGB triads for the carpals body, IK target, and source wrist in the viewer. "
+            "Disabled by default so recorded frames stay clean for BC training."
+        ),
     )
     parser.add_argument(
         "--overlay-scale",
         type=float,
         default=0.20,
-        help=(
-            "Length of the carpals/target RGB triads in meters. "
-            "The source-wrist triad is 60%% of this."
-        ),
+        help="Length of the carpals/target RGB triads in meters.",
     )
     parser.add_argument(
         "--overlay-width",
@@ -249,43 +238,25 @@ def parse_args() -> argparse.Namespace:
         "--settle-steps",
         type=int,
         default=0,
-        help=(
-            "Number of mj_step calls to run after reset so the actuators reach the "
-            "gravity-supported equilibrium before the viewer opens. Defaults to 0 "
-            "because --gravity-compensation already holds q_home exactly; bump this "
-            "only if you disable gravity compensation."
-        ),
+        help="Number of mj_step calls to run after reset before the viewer opens.",
     )
     parser.add_argument(
         "--gravity-compensation",
         action=argparse.BooleanOptionalAction,
         default=True,
-        help=(
-            "Cancel gravity (and Coriolis) bias on the robot DOFs every step "
-            "by setting qfrc_applied=qfrc_bias on the panda_link0 subtree, so "
-            "the position actuators don't have to fight gravity and the arm "
-            "holds q_home steadily instead of sagging into a spring "
-            "equilibrium."
-        ),
+        help="Cancel gravity on the robot DOFs so the arm holds q_home steadily.",
     )
     parser.add_argument(
         "--sim-steps-per-frame",
         type=int,
         default=_ORCA_SIM_HAND_FRAME_SKIP,
-        help=(
-            "MuJoCo substeps per teleop frame while the clutch is engaged. "
-            "Defaults to 5 to match the orca_sim hand-only env frame_skip."
-        ),
+        help="MuJoCo substeps per teleop frame while the clutch is engaged.",
     )
     parser.add_argument(
         "--live-fps",
         type=float,
         default=None,
-        help=(
-            "Optional cap on the live viewer loop rate in Hz. Leave unset so "
-            "physics can run as fast as the host allows; retargeting is "
-            "already deduplicated to one call per Quest telemetry packet."
-        ),
+        help="Optional cap on the live viewer loop rate in Hz.",
     )
     parser.add_argument(
         "--log-level",
@@ -299,12 +270,12 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--record-repo-id",
-        default="fracapuano/orca-panda-test",
+        default="fracapuano/orca-panda-bare",
         help="LeRobotDataset repo id used for local metadata and optional Hub upload.",
     )
     parser.add_argument(
         "--record-task",
-        default="Teleoperate the OrcaPanda to manipulate cubes.",
+        default="Teleoperate the OrcaPanda in free space.",
         help="Task string stored with each LeRobot frame.",
     )
     parser.add_argument(
@@ -321,7 +292,10 @@ def parse_args() -> argparse.Namespace:
         "--record-camera",
         action="append",
         default=[],
-        help="MuJoCo camera to record. Repeatable. Defaults to all scene cameras.",
+        help=(
+            "MuJoCo camera to record. Repeatable. Defaults to all scene cameras "
+            f"(currently just {_DEFAULT_FRONTAL_CAMERA!r})."
+        ),
     )
     parser.add_argument("--record-width", type=int, default=640)
     parser.add_argument("--record-height", type=int, default=480)
@@ -362,8 +336,7 @@ def _make_right_hand_retargeter(args: argparse.Namespace, arm: MujocoPandaArm):
         return None
     if args.side != "right":
         logger.warning(
-            "Hand retargeting is disabled for --side=%s; "
-            "the cube-stacking scene has a right OrcaHand.",
+            "Hand retargeting is disabled for --side=%s; the bare scene ships the right OrcaHand.",
             args.side,
         )
         return None
@@ -512,14 +485,10 @@ def main() -> None:
         datefmt="%H:%M:%S",
     )
 
-    pose = args.pose or (
-        DEFAULT_CUBE_STACKING_KEYFRAME if args.scene == "cube-stacking" else "ready"
-    )
     arm = MujocoPandaArm(
-        model_path=args.model_path,
-        scene=args.scene,
+        scene="bare",
         scene_path=args.scene_path,
-        pose=pose,
+        pose=args.pose,
         settle_steps=args.settle_steps,
         gravity_compensation=args.gravity_compensation,
     )
@@ -726,7 +695,7 @@ def main() -> None:
 
                 if bridge.state.pop_event("reset"):
                     logger.info("Reset event received.")
-                    arm.reset(pose)
+                    arm.reset(args.pose)
                     mapper.reset()
                     target_qpos = arm.arm_qpos()
                     hand_clutch_state = False
@@ -769,10 +738,6 @@ def main() -> None:
                 recv_mono = bridge.state.last_update_monotonic
                 fresh_telemetry = recv_mono > last_retarget_recv_mono
 
-                # Retarget at most once per Quest telemetry packet (same cadence
-                # as teleop_quest_hand_only.py). Calibration can run while the
-                # clutch is disengaged, but commands are only applied once
-                # teleop_active below.
                 if (
                     live_retargeter is not None
                     and args.input_mode == "hand"

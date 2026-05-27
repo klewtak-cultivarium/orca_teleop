@@ -33,6 +33,8 @@ class QuestTelemetryState:
         self._hand_landmarks: dict[str, np.ndarray | None] = {side: None for side in HAND_SIDES}
         self._events: dict[str, bool] = {name: False for name in EVENT_NAMES}
         self._last_update_monotonic = 0.0
+        self._last_update_wall = 0.0
+        self._last_client_wall_ms: float | None = None
 
     def update(self, payload: Mapping[str, Any]) -> None:
         with self._lock:
@@ -81,6 +83,11 @@ class QuestTelemetryState:
                 if payload.get("events", {}).get(event_name):
                     self._events[event_name] = True
 
+            client_wall_ms = payload.get("client_wall_ms")
+            self._last_client_wall_ms = (
+                float(client_wall_ms) if isinstance(client_wall_ms, (int, float)) else None
+            )
+            self._last_update_wall = time.time()
             self._last_update_monotonic = time.monotonic()
 
     def push_event(self, event_name: str) -> None:
@@ -126,6 +133,16 @@ class QuestTelemetryState:
     def last_update_monotonic(self) -> float:
         with self._lock:
             return self._last_update_monotonic
+
+    @property
+    def last_update_wall(self) -> float:
+        with self._lock:
+            return self._last_update_wall
+
+    @property
+    def last_client_wall_ms(self) -> float | None:
+        with self._lock:
+            return self._last_client_wall_ms
 
 
 class QuestTelemetryBridge:

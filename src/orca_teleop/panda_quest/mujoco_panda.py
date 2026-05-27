@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from importlib import resources
 from pathlib import Path
 
 import numpy as np
@@ -11,6 +12,7 @@ from orca_teleop.panda_quest.transforms import make_transform, rotation_vector_f
 READY_ARM_QPOS = np.array([-0.1, -1.6, -0.1, -3.0718, -0.15, 2.85, -1.4027], dtype=np.float64)
 PANDA_JOINT_NAMES = tuple(f"panda_joint{idx}" for idx in range(1, 8))
 DEFAULT_CUBE_STACKING_KEYFRAME = "orcapanda_home"
+DEFAULT_BARE_KEYFRAME = "orcapanda_bare_home"
 RIGHT_HAND_CARPALS_BODY = "orcahand_right_R-Carpals_8d1f1041"
 _RIGHT_HAND_SCENE_JOINT_WRIST = "orcahand_right_R-Carpals_8d1f1041_to_TopTower-Model_4a80d30e"
 _RIGHT_HAND_SCENE_JOINT_THUMB_BASE = "orcahand_right_T-TP-R_1c2b802d_to_R-Carpals_8d1f1041"
@@ -73,6 +75,21 @@ def resolve_legacy_orcapanda_xml(model_path: str | None = None) -> Path:
     )
 
 
+LOCAL_CUBE_STACKING_SCENE = (
+    Path(__file__).resolve().parents[3]
+    / "scene_snapshots"
+    / "orcapanda_cube_stacking_local_2026-05-22"
+    / "orcapanda_cube_stacking.xml"
+)
+
+LOCAL_BARE_SCENE = (
+    Path(__file__).resolve().parents[3]
+    / "scene_snapshots"
+    / "orcapanda_cube_stacking_local_2026-05-22"
+    / "orcapanda_bare.xml"
+)
+
+
 def resolve_orcapanda_cube_stacking_xml(scene_path: str | None = None) -> Path:
     if scene_path is not None:
         path = Path(scene_path).expanduser().resolve()
@@ -81,28 +98,34 @@ def resolve_orcapanda_cube_stacking_xml(scene_path: str | None = None) -> Path:
         return path
 
     try:
-        import orca_sim
-
-        path = Path(orca_sim.__file__).resolve().parent / "scenes" / "orcapanda_cube_stacking.xml"
-        if path.exists():
-            return path.resolve()
+        package_scene = resources.files("orca_sim") / "scenes" / "orcapanda_cube_stacking.xml"
+        if package_scene.is_file():
+            return Path(str(package_scene)).expanduser().resolve()
     except Exception:
         pass
 
-    local_sibling = (
-        Path.home()
-        / "Documents"
-        / "orca_sim"
-        / "src"
-        / "orca_sim"
-        / "scenes"
-        / "orcapanda_cube_stacking.xml"
-    )
-    if local_sibling.exists():
-        return local_sibling.resolve()
+    if LOCAL_CUBE_STACKING_SCENE.exists():
+        return LOCAL_CUBE_STACKING_SCENE.resolve()
 
     raise FileNotFoundError(
-        "Could not resolve orcapanda_cube_stacking.xml. Pass --scene-path or install orca_sim."
+        f"Could not resolve local cube-stacking scene at {LOCAL_CUBE_STACKING_SCENE}. "
+        "Pass --scene-path to override."
+    )
+
+
+def resolve_orcapanda_bare_xml(scene_path: str | None = None) -> Path:
+    if scene_path is not None:
+        path = Path(scene_path).expanduser().resolve()
+        if not path.exists():
+            raise FileNotFoundError(path)
+        return path
+
+    if LOCAL_BARE_SCENE.exists():
+        return LOCAL_BARE_SCENE.resolve()
+
+    raise FileNotFoundError(
+        f"Could not resolve local bare scene at {LOCAL_BARE_SCENE}. "
+        "Pass --scene-path to override."
     )
 
 
@@ -117,11 +140,15 @@ def resolve_panda_model_path(
     if model_path is not None:
         return resolve_legacy_orcapanda_xml(model_path)
     if scene_path is not None:
+        if scene == "bare":
+            return resolve_orcapanda_bare_xml(scene_path)
         return resolve_orcapanda_cube_stacking_xml(scene_path)
     if scene == "legacy":
         return resolve_legacy_orcapanda_xml()
     if scene == "cube-stacking":
         return resolve_orcapanda_cube_stacking_xml()
+    if scene == "bare":
+        return resolve_orcapanda_bare_xml()
     raise ValueError(f"Unsupported scene {scene!r}.")
 
 
@@ -145,6 +172,7 @@ class MujocoPandaArm:
         scene_path: str | None = None,
         ik_config: PandaIkConfig | None = None,
         settle_steps: int = 0,
+        gravity_compensation: bool = True,
     ) -> None:
         import mujoco
 
@@ -180,6 +208,11 @@ class MujocoPandaArm:
         self.target_body_id = self._body_id(self.ik_config.target_body_name)
         self._settle_steps = int(max(0, settle_steps))
 
+        self._gravity_compensation = bool(gravity_compensation)
+        self._robot_dof_ids = (
+            self._compute_robot_dof_ids() if self._gravity_compensation else None
+        )
+
         self.reset(pose)
 
     def reset(self, pose: str = "ready", settle_steps: int | None = None) -> None:
@@ -192,13 +225,13 @@ class MujocoPandaArm:
             self._reset_keyframe(pose)
 
         self.hold_current_qpos()
-        self.mujoco.mj_forward(self.model, self.data)
+        self._apply_gravity_compensation()
 
         n_settle = self._settle_steps if settle_steps is None else int(max(0, settle_steps))
         if n_settle > 0:
             self.mujoco.mj_step(self.model, self.data, nstep=n_settle)
             self.data.qvel[:] = 0.0
-            self.mujoco.mj_forward(self.model, self.data)
+            self._apply_gravity_compensation()
 
     def _reset_keyframe(self, keyframe_name: str) -> None:
         key_id = self.mujoco.mj_name2id(
@@ -277,6 +310,39 @@ class MujocoPandaArm:
             dtype=np.float64,
         )
 
+    def apply_action(self, action: np.ndarray) -> None:
+        """Write a flat action vector matching ``record_joint_ctrl`` ordering.
+
+        Layout is ``[panda_joint1..panda_joint7, *RIGHT_HAND_V2_JOINT_NAMES]``
+        in radians, i.e. the same vector lerobot stores under the ``action``
+        feature when the dataset was recorded with ``LeRobotPandaRecorder``.
+        Values are clipped to per-actuator ctrlrange before writing.
+        """
+        action = np.asarray(action, dtype=np.float64).reshape(-1)
+        expected = len(self.actuator_ids) + len(self.hand_actuator_id_by_v2_joint)
+        if action.shape != (expected,):
+            raise ValueError(
+                f"apply_action expected shape ({expected},), got {action.shape}"
+            )
+        panda_low = self.model.actuator_ctrlrange[self.actuator_ids, 0]
+        panda_high = self.model.actuator_ctrlrange[self.actuator_ids, 1]
+        self.data.ctrl[self.actuator_ids] = np.clip(
+            action[: len(self.actuator_ids)], panda_low, panda_high
+        )
+        hand_slice = action[len(self.actuator_ids) :]
+        for value, name in zip(hand_slice, RIGHT_HAND_V2_JOINT_NAMES, strict=True):
+            actuator_id = self.hand_actuator_id_by_v2_joint.get(name)
+            if actuator_id is None:
+                continue
+            low, high = self.model.actuator_ctrlrange[actuator_id]
+            self.data.ctrl[actuator_id] = float(np.clip(value, low, high))
+
+    def step_action(self, action: np.ndarray, nstep: int = 1) -> None:
+        """``apply_action`` + gravity compensation + ``mj_step`` in one call."""
+        self.apply_action(action)
+        self._apply_gravity_compensation()
+        self.mujoco.mj_step(self.model, self.data, nstep=nstep)
+
     def end_effector_matrix(self) -> np.ndarray:
         self.mujoco.mj_forward(self.model, self.data)
         return make_transform(
@@ -325,7 +391,14 @@ class MujocoPandaArm:
 
     def step(self, target_qpos: np.ndarray, nstep: int = 1) -> None:
         self.set_arm_ctrl(target_qpos)
+        self._apply_gravity_compensation()
         self.mujoco.mj_step(self.model, self.data, nstep=nstep)
+
+    def sync_hold(self) -> None:
+        """Hold every actuator at the current qpos without advancing simulation."""
+        self.hold_current_qpos()
+        self._apply_gravity_compensation()
+        self.mujoco.mj_forward(self.model, self.data)
 
     def _clip_arm_qpos(self, qpos: np.ndarray) -> np.ndarray:
         qpos = np.asarray(qpos, dtype=np.float64)
@@ -392,6 +465,52 @@ class MujocoPandaArm:
                 continue
             mapping[canonical_name] = self._actuator_id_for_joint(joint_id)
         return mapping
+
+    def _compute_robot_dof_ids(self) -> np.ndarray:
+        # The robot subtree is everything descending from the root ancestor of
+        # panda_joint1's body (i.e. panda_link0 in both shipped scenes). We
+        # gather every DOF whose body lives in that subtree so we can apply
+        # gravity compensation only to the robot and leave the scene (table,
+        # cubes, pedestal, etc.) free to fall normally.
+        joint1_body_id = int(self.model.jnt_bodyid[self.joint_ids[0]])
+        robot_root_id = joint1_body_id
+        while int(self.model.body_parentid[robot_root_id]) > 0:
+            robot_root_id = int(self.model.body_parentid[robot_root_id])
+
+        robot_body_ids: set[int] = set()
+        for body_id in range(1, self.model.nbody):
+            ancestor = body_id
+            while ancestor > 0:
+                if ancestor == robot_root_id:
+                    robot_body_ids.add(body_id)
+                    break
+                ancestor = int(self.model.body_parentid[ancestor])
+
+        dof_ids = [
+            dof_id
+            for dof_id in range(self.model.nv)
+            if int(self.model.dof_bodyid[dof_id]) in robot_body_ids
+        ]
+        return np.array(dof_ids, dtype=np.int32)
+
+    def _apply_gravity_compensation(self) -> None:
+        # MuJoCo 3.x exposes a per-body `body_gravcomp` field, but the engine
+        # only honors it when `ngravcomp` (a cached counter) is non-zero, and
+        # `ngravcomp` is fixed at model compile time -- mutating
+        # `body_gravcomp` after `from_xml_path` is silently a no-op. To keep
+        # the third-party scene XML untouched we instead inject the
+        # compensation force ourselves: with `qfrc_applied = qfrc_bias` on the
+        # robot DOFs, MuJoCo's equation of motion `M*qddot + qfrc_bias =
+        # qfrc_actuator + qfrc_applied + qfrc_passive` reduces to
+        # `M*qddot = qfrc_actuator + qfrc_passive`, so the PD position
+        # actuators only need to fight inertia/damping and the arm sits
+        # exactly at `q_home` until commanded otherwise.
+        self.mujoco.mj_forward(self.model, self.data)
+        if not self._gravity_compensation or self._robot_dof_ids is None:
+            return
+        self.data.qfrc_applied[self._robot_dof_ids] = (
+            self.data.qfrc_bias[self._robot_dof_ids]
+        )
 
 
 class RelativeControllerMapper:
