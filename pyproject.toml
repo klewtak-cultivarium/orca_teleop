@@ -7,7 +7,9 @@ authors = [
     {name = "Francesco Capuano", email = "capuano@robots.ox.ac.uk"}
 ]
 readme = "README.md"
-requires-python = ">=3.10"
+# Capped below 3.13: mediapipe-numpy2 (the `mediapipe` extra) and orca_sim only
+# ship wheels through cp312, so 3.13 fails to resolve.
+requires-python = ">=3.10,<3.13"
 dependencies = [
     "numpy>=2.0.0,<3.0.0",
     "torch>=2.8.0",
