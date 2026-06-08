@@ -6,6 +6,7 @@ import torch
 from conftest import KEYVECTORS_SHAPE, plausible_hand_keypoints
 
 from orca_teleop.retargeting.retargeter import (
+    Retargeter,
     RetargeterConfig,
     TargetPose,
     _normalize_regularizer_weights,
@@ -131,3 +132,59 @@ def test_normalize_regularizer_weights_keeps_all_zero_vector():
 def test_normalize_regularizer_weights_rejects_negative_values():
     with pytest.raises(ValueError, match="non-negative"):
         _normalize_regularizer_weights(torch.tensor([1.0, -1.0]))
+
+
+def test_retargeter_rejects_unknown_backend():
+    with pytest.raises(ValueError, match="Unknown retargeter backend"):
+        Retargeter.from_paths(backend="not-a-backend")  # type: ignore[arg-type]
+
+
+def test_retargeter_dispatches_adaptive_backend(monkeypatch):
+    from orca_teleop.retargeting import adaptive_analytical
+
+    calls = {}
+
+    class _StubAdaptive:
+        @classmethod
+        def from_paths(cls, **kwargs):
+            calls.update(kwargs)
+            return cls()
+
+    monkeypatch.setattr(adaptive_analytical, "AdaptiveAnalyticalRetargeter", _StubAdaptive)
+
+    retargeter = Retargeter.from_paths(
+        "model.yaml",
+        "hand.urdf",
+        backend="adaptive_analytical",
+        config_path="retarget.yaml",
+    )
+
+    assert isinstance(retargeter, _StubAdaptive)
+    assert calls == {
+        "model_path": "model.yaml",
+        "urdf_path": "hand.urdf",
+        "config_path": "retarget.yaml",
+    }
+
+
+def test_retargeter_defaults_to_adaptive_backend(monkeypatch):
+    from orca_teleop.retargeting import adaptive_analytical
+
+    calls = {}
+
+    class _StubAdaptive:
+        @classmethod
+        def from_paths(cls, **kwargs):
+            calls.update(kwargs)
+            return cls()
+
+    monkeypatch.setattr(adaptive_analytical, "AdaptiveAnalyticalRetargeter", _StubAdaptive)
+
+    retargeter = Retargeter.from_paths("model.yaml", "hand.urdf")
+
+    assert isinstance(retargeter, _StubAdaptive)
+    assert calls == {
+        "model_path": "model.yaml",
+        "urdf_path": "hand.urdf",
+        "config_path": None,
+    }

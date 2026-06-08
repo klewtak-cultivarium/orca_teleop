@@ -22,6 +22,7 @@ from orca_teleop.pipeline import (
     retargeter_worker,
     robot_worker,
     run,
+    run_local,
 )
 
 
@@ -68,6 +69,18 @@ def test_pipeline_queues_dataclass():
 def test_run_signature_stable():
     sig = inspect.signature(run)
     assert "model_path" in sig.parameters
+
+
+def test_pipeline_defaults_to_adaptive_retargeter():
+    assert (
+        inspect.signature(retargeter_worker).parameters["retargeter_backend"].default
+        == "adaptive_analytical"
+    )
+    assert inspect.signature(run).parameters["retargeter_backend"].default == "adaptive_analytical"
+    assert (
+        inspect.signature(run_local).parameters["retargeter_backend"].default
+        == "adaptive_analytical"
+    )
 
 
 def test_ingress_server_start_stop():
@@ -400,6 +413,50 @@ def test_retargeter_forwards_joint_positions(monkeypatch):
     assert len(actions) > 0
     for action in actions:
         assert isinstance(action, OrcaJointPositions)
+
+
+def test_retargeter_worker_passes_backend_and_config(monkeypatch):
+    calls = {}
+
+    class _StubRetargeter:
+        def __init__(self):
+            self._action = _midpoint_action()
+
+        @classmethod
+        def from_paths(cls, *args, **kwargs):
+            calls["args"] = args
+            calls["kwargs"] = kwargs
+            return cls()
+
+        def retarget(self, _target_pose):
+            return self._action
+
+    monkeypatch.setattr("orca_teleop.pipeline.Retargeter", _StubRetargeter)
+
+    q = _make_queues()
+    stop = threading.Event()
+    q.landmarks_q.put(_make_landmark())
+    t = _start(
+        retargeter_worker,
+        q,
+        stop,
+        "model.yaml",
+        "hand.urdf",
+        "adaptive_analytical",
+        "retarget.yaml",
+        name="retargeter",
+    )
+    time.sleep(0.2)
+    stop.set()
+    t.join(timeout=2.0)
+
+    assert calls == {
+        "args": ("model.yaml", "hand.urdf"),
+        "kwargs": {
+            "backend": "adaptive_analytical",
+            "config_path": "retarget.yaml",
+        },
+    }
 
 
 def test_retargeter_skips_none_actions(monkeypatch):

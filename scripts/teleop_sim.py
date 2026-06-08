@@ -61,6 +61,17 @@ def main() -> None:
     )
     parser.add_argument("--show-video", action="store_true", help="Show webcam feed with landmarks")
     parser.add_argument(
+        "--retargeter",
+        default="adaptive_analytical",
+        choices=["rmsprop", "adaptive_analytical"],
+        help="Retargeter backend (default: adaptive_analytical)",
+    )
+    parser.add_argument(
+        "--retarget-config",
+        default=None,
+        help="YAML config for --retargeter adaptive_analytical",
+    )
+    parser.add_argument(
         "--log-level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"]
     )
     args = parser.parse_args()
@@ -86,6 +97,8 @@ def main() -> None:
             confidence=args.confidence,
             show_video=args.show_video,
             sink=sink,
+            retargeter_backend=args.retargeter,
+            retargeter_config_path=args.retarget_config,
         )
     else:
         run(
@@ -93,6 +106,8 @@ def main() -> None:
             urdf_path=args.urdf_path,
             port=args.port,
             sink=sink,
+            retargeter_backend=args.retargeter,
+            retargeter_config_path=args.retarget_config,
         )
 
 
