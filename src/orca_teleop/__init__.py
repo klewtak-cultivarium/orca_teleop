@@ -8,6 +8,7 @@ from orca_teleop.pipeline import (
     robot_worker,
     run,
     run_local,
+    run_manus_local,
 )
 from orca_teleop.retargeting.retargeter import Retargeter
 
@@ -23,4 +24,5 @@ __all__ = [
     "robot_worker",
     "run",
     "run_local",
+    "run_manus_local",
 ]

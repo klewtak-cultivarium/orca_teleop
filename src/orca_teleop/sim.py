@@ -74,7 +74,7 @@ class OrcaHandSimSink(RecordableSink):
     def __init__(
         self,
         env_name: str = "right",
-        version: str | None = None,
+        version: str | None = "v2",
         render_mode: str = "human",
         camera_config: SimCameraConfig | None = None,
     ) -> None:
