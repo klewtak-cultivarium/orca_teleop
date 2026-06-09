@@ -52,7 +52,7 @@ from orca_teleop.constants import (
     QUEUES_MAXSIZE,
 )
 from orca_teleop.ingress.server import HandLandmarks, IngressServer
-from orca_teleop.retargeting.retargeter import Retargeter, TargetPose
+from orca_teleop.retargeting.retargeter import Retargeter, RetargeterBackend, TargetPose
 
 logger = logging.getLogger(__name__)
 
@@ -238,6 +238,8 @@ def retargeter_worker(
     stop_event: threading.Event,
     model_path: str | None = None,
     urdf_path: str | None = None,
+    retargeter_backend: RetargeterBackend = "adaptive_analytical",
+    retargeter_config_path: str | None = None,
     landmarks_viz: Any | None = None,
 ) -> None:
     """Consume ``HandLandmarks`` from the gRPC ingress, retarget, push to actions_q.
@@ -255,7 +257,12 @@ def retargeter_worker(
 
     try:
         try:
-            retargeter = Retargeter.from_paths(model_path, urdf_path)
+            retargeter = Retargeter.from_paths(
+                model_path,
+                urdf_path,
+                backend=retargeter_backend,
+                config_path=retargeter_config_path,
+            )
         except Exception:
             logger.exception("Retargeter init failed; shutting down worker.")
             return
@@ -352,6 +359,8 @@ def run(
     port: int = DEFAULT_PORT,
     sink: RobotSink | None = None,
     visualize_landmarks: bool = False,
+    retargeter_backend: RetargeterBackend = "adaptive_analytical",
+    retargeter_config_path: str | None = None,
 ) -> None:
     """Start the full teleop pipeline:
     - gRPC-ingress -> retargeter -> robot consumer
@@ -368,6 +377,10 @@ def run(
         port: TCP port for the gRPC ingress server, which streams HandLandmarks to the retargeter.
         sink: Consumer of retargeted joint positions. Defaults to
             ``OrcaHandSink(model_path)``, i.e. a physical OrcaHand.
+        retargeter_backend: Retargeting implementation. ``"adaptive_analytical"``
+            is the default Wuji-style Orca-native backend; ``"rmsprop"`` keeps
+            the historical fingertip key-vector backend available.
+        retargeter_config_path: Optional YAML config for the adaptive backend.
     """
     if sink is None:
         sink = OrcaHandSink(model_path)
@@ -386,13 +399,26 @@ def run(
         landmarks_viz.start()
 
     sink.connect()
+    if model_path is None:
+        sink_model_path = getattr(sink, "retarget_model_path", None)
+        if sink_model_path:
+            model_path = sink_model_path
+            logger.info("Using sink-provided retargeter model: %s", model_path)
 
     ingress_server = IngressServer(queues.landmarks_q, stop_event, port=port)
     ingress_server.start()
 
     retargeter_thread = threading.Thread(
         target=retargeter_worker,
-        args=(queues, stop_event, model_path, urdf_path, landmarks_viz),
+        args=(
+            queues,
+            stop_event,
+            model_path,
+            urdf_path,
+            retargeter_backend,
+            retargeter_config_path,
+            landmarks_viz,
+        ),
         name="retargeter",
     )
     retargeter_thread.start()
@@ -452,6 +478,8 @@ def run_local(
     show_video: bool = False,
     sink: RobotSink | None = None,
     visualize_landmarks: bool = False,
+    retargeter_backend: RetargeterBackend = "adaptive_analytical",
+    retargeter_config_path: str | None = None,
 ) -> None:
     """Run ``run()`` plus a local MediaPipe publisher for one-command teleop.
     Useful for prototyping.
@@ -480,6 +508,8 @@ def run_local(
             port=port,
             sink=sink,
             visualize_landmarks=visualize_landmarks,
+            retargeter_backend=retargeter_backend,
+            retargeter_config_path=retargeter_config_path,
         )
     finally:
         if publisher_process.is_alive():
@@ -600,6 +630,17 @@ if __name__ == "__main__":
         help="Open a live 3D matplotlib window showing hand keypoints",
     )
     parser.add_argument(
+        "--retargeter",
+        default="adaptive_analytical",
+        choices=["rmsprop", "adaptive_analytical"],
+        help="Retargeter backend (default: adaptive_analytical)",
+    )
+    parser.add_argument(
+        "--retarget-config",
+        default=None,
+        help="YAML config for --retargeter adaptive_analytical",
+    )
+    parser.add_argument(
         "--log-level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"]
     )
     args = parser.parse_args()
@@ -628,4 +669,6 @@ if __name__ == "__main__":
             confidence=args.confidence,
             show_video=args.show_video,
             visualize_landmarks=args.visualize_landmarks,
+            retargeter_backend=args.retargeter,
+            retargeter_config_path=args.retarget_config,
         )
