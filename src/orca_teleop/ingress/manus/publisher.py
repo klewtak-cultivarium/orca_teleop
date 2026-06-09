@@ -1,6 +1,6 @@
 """Manus MetaGloves Pro gRPC publisher.
 
-Subscribes to the C++ ``SharpaManusClient`` over ZMQ, converts the 25-joint
+Subscribes to a remote C++ client over ZMQ, converts the 25-joint
 Manus skeleton to the 21-joint MANO layout expected by the retargeter, and
 streams ``HandFrame`` messages to the ``IngressServer`` via gRPC.
 
