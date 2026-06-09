@@ -3,6 +3,7 @@ import os
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from os import PathLike
+from typing import Literal
 
 import numpy as np
 import pytorch_kinematics as pk
@@ -21,6 +22,7 @@ from orca_teleop.retargeting.urdf_offsets import load_ref_offsets
 logger = logging.getLogger(__name__)
 
 FINGERS: tuple[str, ...] = ("thumb", "index", "middle", "ring", "pinky")
+RetargeterBackend = Literal["rmsprop", "adaptive_analytical"]
 
 
 _ORCAHAND_DESCRIPTION_DIR_ENV = "ORCAHAND_DESCRIPTION_DIR"
@@ -355,8 +357,33 @@ class Retargeter:
         cls,
         model_path: str | None = None,
         urdf_path: str | None = None,
+        *,
+        backend: RetargeterBackend = "adaptive_analytical",
+        config_path: str | None = None,
         **kwargs,
     ) -> "Retargeter":
+        if backend == "adaptive_analytical":
+            if kwargs:
+                raise ValueError(
+                    "Adaptive analytical retargeter does not accept RMSprop-specific "
+                    f"options: {sorted(kwargs)}"
+                )
+            from orca_teleop.retargeting.adaptive_analytical import (
+                AdaptiveAnalyticalRetargeter,
+            )
+
+            return AdaptiveAnalyticalRetargeter.from_paths(
+                model_path=model_path,
+                urdf_path=urdf_path,
+                config_path=config_path,
+            )
+        if backend != "rmsprop":
+            raise ValueError(
+                f"Unknown retargeter backend {backend!r}; expected 'rmsprop' or "
+                "'adaptive_analytical'."
+            )
+        if config_path is not None:
+            raise ValueError("config_path is only supported by backend='adaptive_analytical'")
         return cls(RetargeterConfig.from_paths(model_path, urdf_path, **kwargs))
 
     def _ik_loss(self, target_key_vectors: torch.Tensor) -> torch.Tensor:

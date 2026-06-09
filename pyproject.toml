@@ -7,7 +7,9 @@ authors = [
     {name = "Francesco Capuano", email = "capuano@robots.ox.ac.uk"}
 ]
 readme = "README.md"
-requires-python = ">=3.10"
+# Capped below 3.13: mediapipe-numpy2 (the `mediapipe` extra) and orca_sim only
+# ship wheels through cp312, so 3.13 fails to resolve.
+requires-python = ">=3.10,<3.13"
 dependencies = [
     "numpy>=2.0.0,<3.0.0",
     "torch>=2.8.0",
@@ -24,6 +26,13 @@ test = [
 mediapipe = [
     "mediapipe-numpy2",
     "opencv-python",
+]
+adaptive = [
+    "cmeel-tinyxml2<11",
+    "cmeel-urdfdom<5",
+    "nlopt",
+    "pin>=3.8.0",
+    "pyyaml",
 ]
 avp = [
     "avp-stream>=1.0,<2.0",
@@ -45,7 +54,10 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/orca_teleop"]
-artifacts = ["src/orca_teleop/ingress/*.proto"]
+artifacts = [
+    "src/orca_teleop/ingress/*.proto",
+    "src/orca_teleop/retargeting/configs/*.yaml",
+]
 
 [tool.hatch.build.targets.sdist]
 include = [
