@@ -40,7 +40,7 @@ from dataclasses import dataclass
 from typing import Any
 
 import numpy as np
-from orca_core import OrcaHand, OrcaJointPositions
+from orca_core import OrcaHand, OrcaHandTouch, OrcaJointPositions
 
 from orca_teleop.constants import (
     DEFAULT_CONFIDENCE,
@@ -231,6 +231,45 @@ class OrcaHandSink(RecordableSink):
                 pass
         self._captures.clear()
         self._camera_shapes.clear()
+
+
+_TACTILE_FINGER_ORDER = ["thumb", "index", "middle", "ring", "pinky"]
+
+
+class OrcaHandTouchSink(OrcaHandSink):
+    """OrcaHandSink that also connects to and streams tactile sensors.
+
+    Uses OrcaHandTouch, which opens both the motor bus and the sensor serial
+    link. If either connection fails, connect() raises RuntimeError.
+    """
+
+    def __init__(
+        self,
+        model_path: str | None,
+        camera_configs: list[OpenCVCameraConfig] | None = None,
+    ) -> None:
+        super().__init__(model_path, camera_configs)
+        # Replace the OrcaHand created by super with OrcaHandTouch — no I/O in __init__
+        self._hand = OrcaHandTouch(model_path)
+
+    def connect(self) -> None:
+        # OrcaHandTouch.connect() opens motor bus + sensor; sensor failure propagates as
+        # RuntimeError via the parent's "if not success: raise RuntimeError(...)" check.
+        super().connect()
+        self._hand.start_tactile_stream(resultant=True, taxels=False)
+        self._hand.zero_tactile_sensors()
+
+    def get_tactile_reading(self) -> np.ndarray | None:
+        """Return resultant forces as float32 (15,) array, or None if no frame yet.
+
+        Order: [thumb_fx, thumb_fy, thumb_fz, index_fx, ..., pinky_fz].
+        """
+        reading = self._hand.get_tactile_forces()
+        if reading is None:
+            return None
+        return np.array(
+            [reading[f] for f in _TACTILE_FINGER_ORDER], dtype=np.float32
+        ).flatten()
 
 
 def retargeter_worker(

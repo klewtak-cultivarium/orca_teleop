@@ -51,6 +51,7 @@ from orca_teleop.pipeline import (
     _SHUTDOWN,
     OpenCVCameraConfig,
     OrcaHandSink,
+    OrcaHandTouchSink,
     RecordableSink,
     TeleopQueues,
     _mediapipe_publisher,
@@ -63,6 +64,11 @@ _DEFAULT_FPS = 30
 _DEFAULT_NUM_EPISODES = 1
 _DEFAULT_EPISODE_SECONDS = 30.0
 _DEFAULT_REST_SECONDS = 3.0
+
+_TACTILE_FINGER_NAMES = ["thumb", "index", "middle", "ring", "pinky"]
+_TACTILE_RESULTANT_NAMES = [
+    f"{f}_{ax}" for f in _TACTILE_FINGER_NAMES for ax in ("fx", "fy", "fz")
+]  # 15 values: thumb_fx … pinky_fz
 
 # Sentinel pushed onto rec_q between episodes — the recorder calls
 # dataset.save_episode() in response, then keeps draining the next episode.
@@ -221,11 +227,21 @@ def _main_record(argv: list[str]) -> None:
         action="store_true",
         help="Dev only: skip ingress + retargeter, push random actions, do NOT dispatch to hand.",
     )
+    parser.add_argument(
+        "--record-tactile",
+        action="store_true",
+        help=(
+            "Record per-finger resultant tactile forces alongside joint state and actions. "
+            "Requires --backend hardware and a hand with tactile sensors attached."
+        ),
+    )
     args = parser.parse_args(argv)
     if args.backend == "sim" and args.camera:
         parser.error("--camera is only valid with --backend hardware.")
     if args.local and args.stub:
         parser.error("--local cannot be combined with --stub.")
+    if args.record_tactile and args.backend != "hardware":
+        parser.error("--record-tactile requires --backend hardware.")
 
     logging.basicConfig(
         level=logging.INFO,
@@ -247,10 +263,11 @@ def _main_record(argv: list[str]) -> None:
 
         sink: RecordableSink = OrcaHandSimSink()
     else:
-        sink = OrcaHandSink(
-            model_path=args.model_path,
-            camera_configs=_parse_camera_configs(args.camera),
-        )
+        camera_configs = _parse_camera_configs(args.camera)
+        if args.record_tactile:
+            sink = OrcaHandTouchSink(model_path=args.model_path, camera_configs=camera_configs)
+        else:
+            sink = OrcaHandSink(model_path=args.model_path, camera_configs=camera_configs)
     sink.connect()
 
     joint_ids = list(sink.joint_ids)
@@ -265,6 +282,12 @@ def _main_record(argv: list[str]) -> None:
             "dtype": "video",
             "shape": shape,
             "names": ["height", "width", "channels"],
+        }
+    if args.record_tactile:
+        features["observation.tactile.resultant"] = {
+            "dtype": "float32",
+            "shape": (15,),
+            "names": _TACTILE_RESULTANT_NAMES,
         }
 
     target_root = args.root if args.root is not None else _default_lerobot_root(args.repo_id)
@@ -363,6 +386,16 @@ def _main_record(argv: list[str]) -> None:
                     stop_event.set()
                     break
 
+                if args.record_tactile:
+                    tactile_arr = sink.get_tactile_reading()
+                    if tactile_arr is None:
+                        if n_frames == 0:
+                            logger.warning(
+                                "No tactile frame available yet; recording zeros. "
+                                "Check that the sensor stream started correctly."
+                            )
+                        tactile_arr = np.zeros(15, dtype=np.float32)
+
                 frame = {
                     "observation.state": state_arr,
                     "action": action_arr,
@@ -370,6 +403,8 @@ def _main_record(argv: list[str]) -> None:
                 }
                 for cam_name, img in cam_images.items():
                     frame[f"observation.images.{cam_name}"] = img
+                if args.record_tactile:
+                    frame["observation.tactile.resultant"] = tactile_arr
 
                 try:
                     rec_q.put_nowait(frame)
