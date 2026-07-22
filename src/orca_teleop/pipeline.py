@@ -53,6 +53,7 @@ from orca_teleop.constants import (
 )
 from orca_teleop.ingress.server import HandLandmarks, IngressServer
 from orca_teleop.retargeting.retargeter import Retargeter, RetargeterBackend, TargetPose
+from orca_teleop.smoothing import DEFAULT_BETA, DEFAULT_MIN_CUTOFF, LandmarkSmoother
 
 logger = logging.getLogger(__name__)
 
@@ -241,6 +242,9 @@ def retargeter_worker(
     retargeter_backend: RetargeterBackend = "adaptive_analytical",
     retargeter_config_path: str | None = None,
     landmarks_viz: Any | None = None,
+    smooth: bool = True,
+    smooth_min_cutoff: float = DEFAULT_MIN_CUTOFF,
+    smooth_beta: float = DEFAULT_BETA,
 ) -> None:
     """Consume ``HandLandmarks`` from the gRPC ingress, retarget, push to actions_q.
 
@@ -250,6 +254,10 @@ def retargeter_worker(
     auto-scale calibration, and the URDF-frame transform internally. During the
     calibration window it may return ``None``, in which case no robot command is
     enqueued yet.
+
+    When ``smooth`` is True (default), a 1€ filter (:class:`LandmarkSmoother`)
+    is applied to the raw landmarks before retargeting, using each frame's
+    capture timestamp. This reduces MediaPipe jitter without adding much lag.
     """
     _LOG_EVERY = 30
     _t_retarget_ms: list[float] = []
@@ -267,6 +275,10 @@ def retargeter_worker(
             logger.exception("Retargeter init failed; shutting down worker.")
             return
 
+        smoother = (
+            LandmarkSmoother(min_cutoff=smooth_min_cutoff, beta=smooth_beta) if smooth else None
+        )
+
         while not stop_event.is_set():
             try:
                 item = queues.landmarks_q.get(timeout=HEARTBEAT_INTERVAL)
@@ -278,12 +290,16 @@ def retargeter_worker(
             if not isinstance(item, HandLandmarks):
                 raise ValueError(f"Expected instance of HandLandmarks, got {type(item)}")
 
+            keypoints = item.keypoints
+            if smoother is not None:
+                keypoints = smoother(keypoints, item.timestamp_ns)
+
             if landmarks_viz is not None:
-                landmarks_viz.put(item.keypoints, item.handedness)
+                landmarks_viz.put(keypoints, item.handedness)
 
             t_retarget_start = time.perf_counter()
             try:
-                target_pose = TargetPose(joint_positions=item.keypoints, source="mediapipe")
+                target_pose = TargetPose(joint_positions=keypoints, source="mediapipe")
                 action = retargeter.retarget(target_pose)
             except (AssertionError, ValueError):
                 logger.debug("Skipping degenerate landmark frame.")
@@ -361,6 +377,9 @@ def run(
     visualize_landmarks: bool = False,
     retargeter_backend: RetargeterBackend = "adaptive_analytical",
     retargeter_config_path: str | None = None,
+    smooth: bool = True,
+    smooth_min_cutoff: float = DEFAULT_MIN_CUTOFF,
+    smooth_beta: float = DEFAULT_BETA,
 ) -> None:
     """Start the full teleop pipeline:
     - gRPC-ingress -> retargeter -> robot consumer
@@ -381,6 +400,8 @@ def run(
             is the default Wuji-style Orca-native backend; ``"rmsprop"`` keeps
             the historical fingertip key-vector backend available.
         retargeter_config_path: Optional YAML config for the adaptive backend.
+        smooth: Apply a 1€ filter to incoming landmarks before retargeting
+            (default True). Tunable via ``smooth_min_cutoff`` / ``smooth_beta``.
     """
     if sink is None:
         sink = OrcaHandSink(model_path)
@@ -418,6 +439,9 @@ def run(
             retargeter_backend,
             retargeter_config_path,
             landmarks_viz,
+            smooth,
+            smooth_min_cutoff,
+            smooth_beta,
         ),
         name="retargeter",
     )
@@ -480,6 +504,9 @@ def run_local(
     visualize_landmarks: bool = False,
     retargeter_backend: RetargeterBackend = "adaptive_analytical",
     retargeter_config_path: str | None = None,
+    smooth: bool = True,
+    smooth_min_cutoff: float = DEFAULT_MIN_CUTOFF,
+    smooth_beta: float = DEFAULT_BETA,
 ) -> None:
     """Run ``run()`` plus a local MediaPipe publisher for one-command teleop.
     Useful for prototyping.
@@ -510,6 +537,9 @@ def run_local(
             visualize_landmarks=visualize_landmarks,
             retargeter_backend=retargeter_backend,
             retargeter_config_path=retargeter_config_path,
+            smooth=smooth,
+            smooth_min_cutoff=smooth_min_cutoff,
+            smooth_beta=smooth_beta,
         )
     finally:
         if publisher_process.is_alive():
@@ -555,6 +585,9 @@ def run_manus_local(
     zmq_address: str = "tcp://127.0.0.1:2044",
     sink: RobotSink | None = None,
     visualize_landmarks: bool = False,
+    smooth: bool = True,
+    smooth_min_cutoff: float = DEFAULT_MIN_CUTOFF,
+    smooth_beta: float = DEFAULT_BETA,
 ) -> None:
     """Run ``run()`` plus a local Manus ZMQ→gRPC publisher for one-command teleop."""
     import multiprocessing
@@ -587,6 +620,9 @@ def run_manus_local(
             port=port,
             sink=sink,
             visualize_landmarks=visualize_landmarks,
+            smooth=smooth,
+            smooth_min_cutoff=smooth_min_cutoff,
+            smooth_beta=smooth_beta,
         )
     finally:
         if publisher_process.is_alive():
@@ -641,6 +677,24 @@ if __name__ == "__main__":
         help="YAML config for --retargeter adaptive_analytical",
     )
     parser.add_argument(
+        "--smooth",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Apply 1€ landmark smoothing before retargeting (default: on; --no-smooth to disable)",
+    )
+    parser.add_argument(
+        "--smooth-min-cutoff",
+        type=float,
+        default=DEFAULT_MIN_CUTOFF,
+        help=f"1€ min cutoff frequency (default: {DEFAULT_MIN_CUTOFF})",
+    )
+    parser.add_argument(
+        "--smooth-beta",
+        type=float,
+        default=DEFAULT_BETA,
+        help=f"1€ speed coefficient beta (default: {DEFAULT_BETA})",
+    )
+    parser.add_argument(
         "--log-level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"]
     )
     args = parser.parse_args()
@@ -659,6 +713,9 @@ if __name__ == "__main__":
             handedness=args.hand,
             zmq_address=args.zmq_address,
             visualize_landmarks=args.visualize_landmarks,
+            smooth=args.smooth,
+            smooth_min_cutoff=args.smooth_min_cutoff,
+            smooth_beta=args.smooth_beta,
         )
     else:
         run_local(
@@ -671,4 +728,7 @@ if __name__ == "__main__":
             visualize_landmarks=args.visualize_landmarks,
             retargeter_backend=args.retargeter,
             retargeter_config_path=args.retarget_config,
+            smooth=args.smooth,
+            smooth_min_cutoff=args.smooth_min_cutoff,
+            smooth_beta=args.smooth_beta,
         )
